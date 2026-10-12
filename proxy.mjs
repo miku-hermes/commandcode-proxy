@@ -4730,7 +4730,8 @@ header#bar{position:sticky;top:0;z-index:20;display:flex;align-items:center;gap:
 .stat.bad{border-color:rgba(255,59,48,.4);background:rgba(255,59,48,.06)}
 .stat.bad b{color:var(--danger)}
 .spacer{flex:1}
-nav#tabs{display:flex;gap:2px;flex-wrap:wrap;width:max-content;max-width:calc(100% - 40px);margin:16px 20px 0;padding:3px;background:var(--bg-tertiary);border-radius:11px}
+.tabs-wrap{max-width:1440px;margin:16px auto 0;padding:0 20px}
+nav#tabs{display:flex;gap:2px;flex-wrap:wrap;width:max-content;max-width:100%;margin:0;padding:3px;background:var(--bg-tertiary);border-radius:11px}
 .tab{background:transparent;border:0;color:var(--text-secondary);padding:6px 15px;border-radius:8px;cursor:pointer;font-size:13px;font-weight:500;font-family:inherit;transition:color .18s ease,background .18s ease,box-shadow .18s ease}
 .tab:hover{color:var(--text-primary)}
 .tab.active{background:var(--bg-secondary);color:var(--text-primary);box-shadow:0 1px 2px rgba(0,0,0,.10),0 0 0 .5px rgba(0,0,0,.04)}
@@ -4739,7 +4740,8 @@ main#view .stats{margin:0 0 14px}
 .section-head{display:flex;align-items:center;gap:12px;margin:0 0 14px}
 .section-head h2{margin:0;font-size:17px;font-weight:600;letter-spacing:-.015em}
 .section-head .btn{margin-left:auto}
-.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(330px,1fr));gap:14px}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(330px,1fr));gap:14px}
+.grid>.card:only-child{max-width:480px}
 .card{position:relative;background:var(--bg-card);border:1px solid var(--border-light);border-radius:var(--radius-lg);padding:16px;box-shadow:var(--shadow-sm);transition:box-shadow .22s ease}
 .card:hover{box-shadow:var(--shadow-md)}
 .card::before{content:"";position:absolute;left:0;top:16px;bottom:16px;width:3px;border-radius:0 3px 3px 0;background:var(--border-color)}
@@ -4807,10 +4809,11 @@ td{font-variant-numeric:tabular-nums}
 @keyframes spin{to{transform:rotate(360deg)}}
 @media (max-width:640px){
   header#bar{padding:10px 14px;gap:10px}
-  nav#tabs{margin:12px 14px 0;max-width:calc(100% - 28px)}
+  .tabs-wrap{margin:12px auto 0;padding:0 14px}
   main#view{padding:14px}
   .brand .muted{display:none}
   .grid{grid-template-columns:1fr}
+  .grid>.card:only-child{max-width:none}
   .modal{width:100%;padding:18px}
 }
 @media (prefers-reduced-motion:reduce){
@@ -4829,13 +4832,15 @@ td{font-variant-numeric:tabular-nums}
     <button class="theme-toggle" id="theme-toggle" type="button" aria-label="切换主题"><svg class="sun" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="4"></circle><path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41"></path></svg><svg class="moon" viewBox="0 0 24 24" aria-hidden="true"><path d="M20.5 15.5A8.5 8.5 0 0 1 8.5 3.5 8.5 8.5 0 1 0 20.5 15.5z"></path></svg></button>
     <button class="btn" id="logout">登出</button>
   </header>
-  <nav id="tabs">
-    <button class="tab" data-tab="accounts">账号</button>
-    <button class="tab" data-tab="clients">客户端令牌</button>
-    <button class="tab" data-tab="routing">路由配置</button>
-    <button class="tab" data-tab="metrics">指标</button>
-    <button class="tab" data-tab="usage">额度</button>
-  </nav>
+  <div class="tabs-wrap">
+    <nav id="tabs">
+      <button class="tab" data-tab="accounts">账号</button>
+      <button class="tab" data-tab="clients">客户端令牌</button>
+      <button class="tab" data-tab="routing">路由配置</button>
+      <button class="tab" data-tab="metrics">指标</button>
+      <button class="tab" data-tab="usage">额度</button>
+    </nav>
+  </div>
   <main id="view"></main>
 </div>
 <div class="toast-wrap" id="toasts"></div>
