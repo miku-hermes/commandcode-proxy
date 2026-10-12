@@ -135,6 +135,16 @@ function clampNum(v, dflt, min, max) {
   if (!Number.isFinite(n)) return dflt;
   return Math.min(max, Math.max(min, n));
 }
+function weightsToPercent(weights) {
+  const defaults = defaultRouting().weights;
+  const percent = {};
+  for (const key of Object.keys(defaults)) {
+    const value = weights?.[key];
+    percent[key] = Math.min(100, Math.max(0, Math.round(
+      (Number.isFinite(value) ? value : defaults[key]) * 100)));
+  }
+  return percent;
+}
 function sanitizeName(v, fallback) {
   const s = String(v ?? '').replace(/[\u0000-\u001f\u007f]/g, '').trim().slice(0, 64);
   return s || fallback;
@@ -4663,6 +4673,8 @@ async function allAccountsUsage(force) {
 // 转义纪律：内嵌 JS 一律单引号拼接，禁止反引号与 ${；DOM 一律 textContent/createElement，严禁 innerHTML。
 function sendAdminShell(req, res) {
   const nonce = crypto.randomBytes(16).toString('base64');
+  const initWeights = '<script nonce="' + nonce + '">var INIT_WEIGHTS='
+    + JSON.stringify(weightsToPercent(STORE.routing.weights)) + ';</script>';
   const html = `<!doctype html>
 <html lang="zh">
 <head>
@@ -4819,12 +4831,14 @@ td{font-variant-numeric:tabular-nums}
   <main id="view"></main>
 </div>
 <div class="toast-wrap" id="toasts"></div>
+${initWeights}
 <script nonce="${nonce}">
 (function(){
 'use strict';
 var TKEY='ccp_admin_token';
 var token=sessionStorage.getItem(TKEY)||'';
 var S={tab:'accounts',accounts:[],clients:[],routing:null,metrics:null,config:null,usage:null,usageLoading:false};
+var pollTimer;
 
 function byId(x){return document.getElementById(x);}
 function el(tag,cls,text){var e=document.createElement(tag);if(cls)e.className=cls;if(text!==undefined&&text!==null)e.textContent=String(text);return e;}
@@ -4858,7 +4872,19 @@ function api(path,opts){
 function post(path,body){return api(path,{method:'POST',body:body});}
 function del(path){return api(path,{method:'DELETE'});}
 
-function refresh(){
+function isEditing(){
+  if(document.querySelector('.overlay'))return true;
+  var active=document.activeElement;
+  return !!(active&&byId('view').contains(active)&&/^(INPUT|TEXTAREA|SELECT)$/.test(active.tagName));
+}
+function resumePolling(){
+  if(!token||document.hidden||isEditing())return;
+  clearInterval(pollTimer);
+  refresh();
+  pollTimer=setInterval(function(){if(token&&!document.hidden)refresh();},2000);
+}
+function refresh(force){
+  if(!force&&isEditing())return;
   if(!token){showAuth();return;}
   return Promise.all([
     api('/admin/api/accounts'),
@@ -4867,9 +4893,11 @@ function refresh(){
     api('/admin/api/metrics'),
     api('/admin/api/config')
   ]).then(function(res){
+    if(!force&&isEditing())return;
     S.accounts=res[0].accounts||[];
     S.clients=res[1].clients||[];
     S.routing=res[2].routing||null;
+    INIT_WEIGHTS=res[2].weightsPercent||INIT_WEIGHTS;
     S.metrics=res[3]||null;
     S.config=res[4]||null;
     render();
@@ -5159,7 +5187,7 @@ function showTokenOnce(tk,title){
 function renderRouting(root){
   var head=el('div','section-head');append(head,el('h2',null,'路由配置'));root.appendChild(head);
   var R=S.routing||{};
-  var W=R.weights||{successRate:0.5,latency:0.3,load:0.2};
+  var W=INIT_WEIGHTS;
   append(root,el('p','muted','评分：score = (wS·成功率 + wL·延迟 + wC·负载) × 账号权重因子。修改后立即热生效（无需重启）。'));
   var card=el('div','card');
   var wRow=el('div','grid');
@@ -5207,7 +5235,7 @@ function renderRouting(root){
       creditUsageThreshold:Number(pCu.inp.value),
       weights:{successRate:Number(sS.inp.value)/100,latency:Number(sL.inp.value)/100,load:Number(sC.inp.value)/100}
     };
-    api('/admin/api/routing',{method:'PUT',body:body}).then(function(){toast('路由配置已更新','ok');refresh();})
+    api('/admin/api/routing',{method:'PUT',body:body}).then(function(){toast('路由配置已更新','ok');refresh(true);})
       .catch(function(e){err.textContent=(e&&e.message)?e.message:'保存失败';});
   }));
   append(card,act);
@@ -5349,10 +5377,19 @@ function boot(){
   byId('logout').onclick=logout;
   var tabs=byId('tabs').children;
   for(var i=0;i<tabs.length;i++){
-    (function(b){b.onclick=function(){S.tab=b.getAttribute('data-tab');renderTabs();renderView();};})(tabs[i]);
+    (function(b){b.onclick=function(){S.tab=b.getAttribute('data-tab');renderTabs();renderView();resumePolling();};})(tabs[i]);
   }
-  setInterval(function(){if(token&&!document.hidden)refresh();},2000);
-  document.addEventListener('visibilitychange',function(){if(token&&!document.hidden)refresh();});
+  pollTimer=setInterval(function(){if(token&&!document.hidden)refresh();},2000);
+  byId('view').addEventListener('focusout',function(){setTimeout(resumePolling,0);});
+  new MutationObserver(function(records){
+    var closed=records.some(function(record){
+      return Array.prototype.some.call(record.removedNodes,function(node){
+        return node.nodeType===1&&node.classList.contains('overlay');
+      });
+    });
+    if(closed)resumePolling();
+  }).observe(document.body,{childList:true});
+  document.addEventListener('visibilitychange',function(){if(!document.hidden)resumePolling();});
   if(token){byId('app').hidden=false;refresh();}
   else showAuth();
 }
@@ -5597,7 +5634,7 @@ async function handleAdmin(req, res, url) {
 
     // ── /admin/api/routing ──────────────────────────────
     if (segs[0] === 'routing' && segs.length === 1) {
-      if (method === 'GET') return adminJSON(res, 200, { routing: STORE.routing });
+      if (method === 'GET') return adminJSON(res, 200, { routing: STORE.routing, weightsPercent: weightsToPercent(STORE.routing.weights) });
       if (method === 'PUT') {
         const body = await getBody();
         if (body.weights && typeof body.weights === 'object') {
