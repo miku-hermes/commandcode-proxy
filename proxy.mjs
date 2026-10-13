@@ -4529,6 +4529,10 @@ function validateAccountIds(v) {
 //   GET /alpha/billing/subscriptions?orgId=…  → { data:{ planId, status, currentPeriodStart, currentPeriodEnd } }
 //   GET /alpha/usage/summary?orgId=…&since=…  → { totalCost }
 const USAGE_TTL_MS = 300000;   // 同一账号额度结果缓存 5 分钟，避免前端轮询把上游打爆
+const USAGE_REFRESH_MS = (() => {
+  const ms = Number.parseInt(process.env.CC_USAGE_REFRESH_MS ?? '', 10);
+  return Number.isFinite(ms) && ms > 0 ? ms : USAGE_TTL_MS;
+})();
 const USAGE_TIMEOUT_MS = 10000;
 const USAGE_CONCURRENCY = 4;   // 批量拉取并发上限
 const PLAN_TOTAL_CREDITS = {
@@ -4544,6 +4548,8 @@ const PLAN_NAMES = {
 const PLAN_KEYS = Object.keys(PLAN_TOTAL_CREDITS).sort((a, b) => b.length - a.length);
 const usageCache = new Map();  // accountId → { at, view }
 const usageInFlight = new Map();  // accountId → Promise
+let usageRefreshing = false;
+let nextUsageRefreshAt = Date.now() + 3000;
 
 function planInfoOf(planId) {
   if (!planId || typeof planId !== 'string') return null;
@@ -4667,6 +4673,42 @@ async function allAccountsUsage(force) {
   });
   await Promise.all(workers);
   return out;
+}
+function refreshUsageInBackground() {
+  if (usageRefreshing) return Promise.resolve(false);
+  usageRefreshing = true;
+  const startedAt = Date.now();
+  let views = [];
+  return allAccountsUsage(true).then((out) => { views = out; }, () => {}).finally(() => {
+    usageRefreshing = false;
+    const ok = views.filter(v => v && v.ok === true).length;
+    log('info', 'usage refreshed', {
+      accounts: STORE.accounts.length,
+      ok,
+      failed: STORE.accounts.length - ok,
+      ms: Date.now() - startedAt,
+    });
+  }).then(() => true);
+}
+function usageSnapshot() {
+  const usage = STORE.accounts.map(account => {
+    const cached = usageCache.get(account.id);
+    if (!cached) return { id: account.id, name: account.name, enabled: account.enabled, ok: null, pending: true };
+    return { ...cached.view, id: account.id, name: account.name, enabled: account.enabled };
+  });
+  const fetchedAt = usage.reduce((latest, view) => {
+    if (!view || !view.fetchedAt) return latest;
+    if (!latest || view.fetchedAt > latest) return view.fetchedAt;
+    return latest;
+  }, null);
+  return {
+    usage,
+    ttlMs: USAGE_TTL_MS,
+    refreshMs: USAGE_REFRESH_MS,
+    refreshing: usageRefreshing,
+    fetchedAt,
+    nextRefreshAt: nextUsageRefreshAt ? new Date(nextUsageRefreshAt).toISOString() : null,
+  };
 }
 
 // 零机密 HTML 外壳：不需要令牌（令牌由前端弹框输入，仅存 sessionStorage）
@@ -4869,7 +4911,7 @@ ${initWeights}
 'use strict';
 var TKEY='ccp_admin_token';
 var token=sessionStorage.getItem(TKEY)||'';
-var S={tab:'accounts',accounts:[],clients:[],routing:null,metrics:null,config:null,usage:null,usageLoading:false};
+var S={tab:'accounts',accounts:[],clients:[],routing:null,metrics:null,config:null,usage:null,usageLoading:false,usageFetchedAt:null,usageRefreshMs:300000,usageRefreshing:false,usagePollAttempts:0,usagePollTimer:null,usageRefreshBaseline:null,usageRefreshDeadline:0};
 var pollTimer;
 var renderedTab='';
 var viewAnimation=null;
@@ -5407,28 +5449,61 @@ function usageBar(percent){
   else if(p>=0.7)fill.className='warn';
   append(bar,fill);return bar;
 }
+function usageHasData(items){return !items||items.length===0||items.some(function(u){return !u.pending;});}
+function usageStatusText(){
+  if(!S.usageFetchedAt)return '查询中…';
+  var t=new Date(S.usageFetchedAt).getTime();
+  if(!isFinite(t))return '查询中…';
+  var minutes=Math.max(0,Math.floor((Date.now()-t)/60000));
+  var refreshMinutes=Math.max(1,Math.round((Number(S.usageRefreshMs)||300000)/60000));
+  return '更新于 '+minutes+' 分钟前 · 每 '+refreshMinutes+' 分钟自动刷新';
+}
+function scheduleUsagePoll(){
+  clearTimeout(S.usagePollTimer);
+  S.usagePollTimer=setTimeout(function(){S.usagePollTimer=null;loadUsage(false);},2000);
+}
+function finishUsageRefresh(ok){
+  clearTimeout(S.usagePollTimer);S.usagePollTimer=null;
+  S.usageRefreshing=false;S.usageRefreshBaseline=null;S.usageRefreshDeadline=0;
+  if(S.tab==='usage')renderView();
+  toast(ok?'额度已刷新':'额度刷新超时',ok?'ok':'err');
+}
 function loadUsage(force){
   if(S.usageLoading)return Promise.resolve();
+  if(!force&&S.usageRefreshing&&S.usageRefreshDeadline&&Date.now()>=S.usageRefreshDeadline){finishUsageRefresh(false);return Promise.resolve();}
+  if(!force&&!S.usageRefreshing&&S.usagePollAttempts>=10)return Promise.resolve();
+  if(force){
+    clearTimeout(S.usagePollTimer);S.usagePollTimer=null;
+    S.usageRefreshing=true;S.usageRefreshBaseline=S.usageFetchedAt;S.usageRefreshDeadline=Date.now()+15000;
+    if(S.tab==='usage')renderView();
+  } else if(!S.usageRefreshing)S.usagePollAttempts++;
   S.usageLoading=true;
   return api('/admin/api/usage'+(force?'?refresh=1':'')).then(function(j){
-    S.usage=j.usage||[];S.usageLoading=false;
+    S.usage=j.usage||[];S.usageFetchedAt=j.fetchedAt||null;S.usageRefreshMs=Number(j.refreshMs)||300000;
+    var hasData=usageHasData(S.usage);var advanced=!!S.usageFetchedAt&&S.usageFetchedAt!==S.usageRefreshBaseline;
+    S.usageLoading=false;
     if(S.tab==='usage')renderView();
-    if(force)toast('额度已刷新','ok');
+    if(S.usageRefreshing){
+      if((!j.refreshing&&advanced)||(!j.refreshing&&S.usage.length===0))finishUsageRefresh(true);
+      else if(Date.now()<S.usageRefreshDeadline)scheduleUsagePoll();
+      else finishUsageRefresh(false);
+    } else if(!hasData&&S.usagePollAttempts<10)scheduleUsagePoll();
   }).catch(function(e){
     S.usageLoading=false;
+    if(S.usageRefreshing)finishUsageRefresh(false);
     if(e&&e.auth){showAuth();return;}
     toast('额度加载失败：'+(e&&e.message?e.message:String(e)),'err');
   });
 }
 function renderUsage(root){
   var head=el('div','section-head');
-  append(head,el('h2',null,'Command Code 额度'));
-  append(head,mkbtn('刷新','',function(){loadUsage(true);}));
+  append(head,el('h2',null,'Command Code 额度'),el('span','muted',usageStatusText()));
+  append(head,mkbtn(S.usageRefreshing?'刷新中…':'刷新','',function(){if(!S.usageRefreshing)loadUsage(true);}));
   root.appendChild(head);
-  append(root,el('p','muted','直接读取上游 /alpha/whoami 与 /alpha/billing/*，每账号缓存 5 分钟；账号 key 全程不外泄。'));
-  if(!S.usage){
-    append(root,loadingEl('加载额度…'));
-    if(!S.usageLoading)loadUsage(false);
+  append(root,el('p','muted','直接读取上游 /alpha/whoami 与 /alpha/billing/*，后台每 '+Math.max(1,Math.round((Number(S.usageRefreshMs)||300000)/60000))+' 分钟自动刷新；账号 key 全程不外泄。'));
+  if(!S.usage||!usageHasData(S.usage)){
+    append(root,loadingEl('后台正在查询额度…'));
+    if(!S.usageLoading&&S.usagePollAttempts===0)loadUsage(false);
     return;
   }
   if(S.usage.length===0){append(root,el('p','empty-state','还没有账号。'));return;}
@@ -5439,6 +5514,10 @@ function renderUsage(root){
   S.usage.forEach(function(u){
     var r=el('tr');
     append(r,el('td',null,u.name||u.id));
+    if(u.pending){
+      var pendingTd=el('td');pendingTd.colSpan=8;pendingTd.className='muted';pendingTd.textContent='查询中…';
+      append(r,pendingTd);append(tb,r);return;
+    }
     if(!u.ok){
       var td=el('td');td.colSpan=8;td.className='muted';
       td.textContent='读取失败：'+(u.error||'unknown');
@@ -5448,8 +5527,7 @@ function renderUsage(root){
     var subscriptionStatus=(u.subscription&&u.subscription.status)?u.subscription.status:'—';var subscriptionCell=el('td');append(subscriptionCell,statusBadge(subscriptionStatus,subscriptionStatus==='active'?'green':'gray'));append(r,subscriptionCell);
     var c=u.credits||{};
     var tdRem=el('td','num');
-    append(tdRem,el('b',null,usageMoney(c.totalRemaining)),
-      el('div','muted','月 '+usageMoney(c.monthlyRemaining)+' · 充值 '+usageMoney(c.purchasedRemaining)+' · 免费 '+usageMoney(c.freeRemaining)));
+    append(tdRem,el('b',null,usageMoney(c.totalRemaining)),el('div','muted','月 '+usageMoney(c.monthlyRemaining)+' · 充值 '+usageMoney(c.purchasedRemaining)+' · 免费 '+usageMoney(c.freeRemaining)));
     append(r,tdRem);
     append(r,el('td','num',usageMoney(c.totalSpent)));
     append(r,el('td','num',usageMoney(c.totalPool)));
@@ -5763,8 +5841,12 @@ async function handleAdmin(req, res, url) {
     // ── /admin/api/usage ────────────────────────────────
     if (segs[0] === 'usage' && segs.length === 1 && method === 'GET') {
       const force = url.searchParams.get('refresh') === '1';
-      const usage = await allAccountsUsage(force);
-      return adminJSON(res, 200, { usage, ttlMs: USAGE_TTL_MS, fetchedAt: new Date().toISOString() });
+      const cold = STORE.accounts.some(account => !usageCache.has(account.id));
+      if (force || cold) {
+        refreshUsageInBackground();
+        await sleep(force ? 25 : 100);
+      }
+      return adminJSON(res, 200, usageSnapshot());
     }
 
     // ── /admin/api/metrics ──────────────────────────────
@@ -5937,6 +6019,16 @@ server.keepAliveTimeout = KEEPALIVE_TIMEOUT_MS;
 server.headersTimeout = KEEPALIVE_TIMEOUT_MS + 1000;   // Node 要求 headersTimeout > keepAliveTimeout
 
 server.listen(CFG.port, CFG.host, () => {
+  const usageStartupTimer = setTimeout(() => {
+    nextUsageRefreshAt = Date.now() + USAGE_REFRESH_MS;
+    refreshUsageInBackground();
+  }, 3000);
+  usageStartupTimer.unref?.();
+  const usageInterval = setInterval(() => {
+    nextUsageRefreshAt = Date.now() + USAGE_REFRESH_MS;
+    refreshUsageInBackground();
+  }, USAGE_REFRESH_MS);
+  usageInterval.unref?.();
   log('info', 'CC Proxy started', {
     url: `http://${CFG.host}:${CFG.port}`,
     api: CFG.apiBase,
