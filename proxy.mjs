@@ -4815,6 +4815,12 @@ td{font-variant-numeric:tabular-nums}
   .brand .muted{display:none}
   .grid{grid-template-columns:1fr}
   .grid>.card:only-child{max-width:none}
+  .btn{white-space:nowrap}
+  .card .actions .btn{flex:1 0 auto}
+  .btn.tiny{min-height:32px}
+  input[type=range]{min-height:32px}
+  label.switch{min-height:32px}
+  #authbox .modal>.btn{width:100%}
   .modal{width:100%;padding:18px}
   .table-wrap{overflow-x:visible}
   .table-wrap table,.table-wrap tbody{display:block}
