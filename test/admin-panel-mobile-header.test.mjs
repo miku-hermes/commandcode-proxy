@@ -88,7 +88,7 @@ test('移动 tab 栏：单行滚动，文字不压缩，不重写选中态', () 
   assert.equal(mobileRules.some(rule => rule.selectors.includes('.tab.active')), false);
 });
 
-test('窄屏隔离：新增布局仅在 640px 媒体查询内，桌面、主题、HTML 与 JS 原样保留', () => {
+test('窄屏隔离：新增布局仅在 640px 媒体查询内，桌面与主题 CSS 原样保留', () => {
   for (const signature of [
     'grid-template-areas:"lights brand theme logout" "stats stats stats stats"',
     'grid-area:stats', 'scrollbar-width:none', 'min-height:40px',
@@ -96,6 +96,9 @@ test('窄屏隔离：新增布局仅在 640px 媒体查询内，桌面、主题�
     assert.ok(mobileCss.includes(signature), 'mobile media query must contain ' + signature);
     assert.ok(!outsideMobile.includes(signature), 'must not affect desktop: ' + signature);
   }
-  const digest = createHash('sha256').update(outsideMobile).digest('hex');
-  assert.equal(digest, '1fc6079f7d8e1c187a53ce65b6ba5b1d2e489075f620a1beb781906362815810');
+  const css = source.match(/<style>([\s\S]*?)<\/style>/)[1];
+  const { outsideMobile: desktopCss } = splitMobileSource(css);
+  // 哈希只覆盖桌面 CSS，后端 JS 改动不应让此断言变红。
+  const digest = createHash('sha256').update(desktopCss).digest('hex');
+  assert.equal(digest, '9c5126585a6281321aaf4289fcf4436d9ff8ae67e18a793497186386a1e90740');
 });

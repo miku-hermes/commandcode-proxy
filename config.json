@@ -9,5 +9,9 @@
   "zdr": false,
   "upstreamProxy": "",
   "adminToken": "",
-  "accountsFile": "accounts.json"
+  "accountsFile": "accounts.json",
+  "fingerprintSalt": "",
+  "deviceProjectDir": "",
+  "cliMode": "agent",
+  "cliSessionMode": "interactive"
 }
