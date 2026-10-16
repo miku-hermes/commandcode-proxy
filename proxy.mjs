@@ -82,7 +82,9 @@ function defaultRouting() {
   return {
     strategy: 'weighted',
     selection: 'weighted_random',           // weighted_random | best
-    weights: { successRate: 0.5, latency: 0.3, load: 0.2 },
+    weights: { successRate: 0.5, latency: 0.3, load: 0.2, quota: 0.2 },
+    quotaFloor: 0.2,
+    quotaUnknownScore: 1,
     windowSizeMs: 300000,                   // 成功率滚动窗口 5min
     bucketMs: 30000,                        // 窗口分桶粒度（内存 O(1)）
     priorAlpha: 5,                          // Beta 先验强度（冷启动）
@@ -161,6 +163,7 @@ function normalizeRouting(raw) {
     r.weights.successRate = clampNum(raw.weights.successRate, d.weights.successRate, 0, 1000);
     r.weights.latency = clampNum(raw.weights.latency, d.weights.latency, 0, 1000);
     r.weights.load = clampNum(raw.weights.load, d.weights.load, 0, 1000);
+    r.weights.quota = clampNum(raw.weights.quota, d.weights.quota, 0, 1000);
   }
   r.windowSizeMs = clampNum(raw.windowSizeMs, d.windowSizeMs, 10000, 86400000);
   r.bucketMs = clampNum(raw.bucketMs, d.bucketMs, 1000, r.windowSizeMs);
@@ -171,6 +174,8 @@ function normalizeRouting(raw) {
   r.latencyCeilMs = clampNum(raw.latencyCeilMs, d.latencyCeilMs, r.latencyFloorMs + 1, 3600000);
   r.unknownLatencyScore = clampNum(raw.unknownLatencyScore, d.unknownLatencyScore, 0, 1);
   r.loadReference = clampNum(raw.loadReference, d.loadReference, 0.1, 10000);
+  r.quotaFloor = clampNum(raw.quotaFloor, d.quotaFloor, 0, 1);
+  r.quotaUnknownScore = clampNum(raw.quotaUnknownScore, d.quotaUnknownScore, 0, 1);
   r.cooldownBaseMs = clampNum(raw.cooldownBaseMs, d.cooldownBaseMs, 1000, 3600000);
   r.cooldownMaxMs = clampNum(raw.cooldownMaxMs, d.cooldownMaxMs, r.cooldownBaseMs, 86400000);
   r.failureCooldownThreshold = clampNum(raw.failureCooldownThreshold, d.failureCooldownThreshold, 1, 1000);
@@ -283,6 +288,8 @@ const runtime = new Map(); // accountId → metrics
 function newRuntime() {
   return {
     inFlight: 0,
+    usagePercent: null,
+    usageAt: 0,
     totals: { requests: 0, ok: 0, fail: 0, neutral: 0, retried: 0 },
     buckets: [],
     consecutiveFailures: 0,
@@ -313,6 +320,8 @@ function resetRuntime(id) {
   const old = getRuntime(id);
   const next = newRuntime();
   next.inFlight = old.inFlight;
+  next.usagePercent = old.usagePercent;
+  next.usageAt = old.usageAt;
   next.creditExhausted = old.creditExhausted;
   next.creditResetAt = old.creditResetAt;
   next.windowExhausted = old.windowExhausted;
@@ -414,17 +423,23 @@ function scoreAccount(account, r, now, routing, maxWeight) {
     ? Math.min(1, Math.max(0, 1 - r.inFlight / account.maxInflight))
     : 1 / (1 + r.inFlight / routing.loadReference);
 
-  const wsum = routing.weights.successRate + routing.weights.latency + routing.weights.load;
-  const wS = wsum > 0 ? routing.weights.successRate / wsum : 1 / 3;
-  const wL = wsum > 0 ? routing.weights.latency / wsum : 1 / 3;
-  const wC = wsum > 0 ? routing.weights.load / wsum : 1 / 3;
-  const base = wS * S + wL * L + wC * C;
+  const remaining = Number.isFinite(r.usagePercent) ? Math.min(1, Math.max(0, 1 - r.usagePercent)) : null;
+  const Q = routing.quotaFloor === 0 ? 0 : remaining === null
+    ? routing.quotaUnknownScore
+    : (remaining >= routing.quotaFloor ? 1
+      : Math.min(1, Math.max(0, remaining / Math.max(routing.quotaFloor, 1e-6))));
+  const wsum = routing.weights.successRate + routing.weights.latency + routing.weights.load + routing.weights.quota;
+  const wS = wsum > 0 ? routing.weights.successRate / wsum : 1 / 4;
+  const wL = wsum > 0 ? routing.weights.latency / wsum : 1 / 4;
+  const wC = wsum > 0 ? routing.weights.load / wsum : 1 / 4;
+  const wQ = wsum > 0 ? routing.weights.quota / wsum : 1 / 4;
+  const base = wS * S + wL * L + wC * C + wQ * Q;
   const weightFactor = maxWeight > 0 ? account.weight / maxWeight : 1;
   const score = r.creditExhausted || r.windowExhausted || r.cooldownUntil > now ? 0 : base * weightFactor;
   return {
     score,
     components: {
-      success: S, latency: L, load: C, weightFactor, base,
+      success: S, latency: L, load: C, quota: Q, usagePercent: r.usagePercent, remaining, weightFactor, base,
       samples: st.n, ok: st.ok, fail: st.fail,
       cooldownUntil: r.cooldownUntil, ewmaTtftMs: r.ewmaTtftMs, inFlight: r.inFlight,
     },
@@ -4981,6 +4996,8 @@ async function getAccountUsage(account, force) {
       const data = await fetchAccountUsage(account);
       view = { id: account.id, name: account.name, enabled: account.enabled, ...data };
       const rt = getRuntime(account.id);
+      if (Number.isFinite(view.credits.usagePercent)) rt.usagePercent = view.credits.usagePercent;
+      rt.usageAt = Date.now();
       expireWindowBlock(rt, Date.now());
       updateWindowBlock(rt, view.credits.windowLimits, Date.now());
       const resetAt = creditResetAtOf(view);
@@ -5677,7 +5694,7 @@ function renderRouting(root){
   var head=el('div','section-head');append(head,el('h2',null,'路由配置'));root.appendChild(head);
   var R=S.routing||{};
   var W=INIT_WEIGHTS;
-  append(root,el('p','muted','评分：score = (wS·成功率 + wL·延迟 + wC·负载) × 账号权重因子。修改后立即热生效（无需重启）。'));
+  append(root,el('p','muted','评分：score = (wS·成功率 + wL·延迟 + wC·负载 + wQ·额度) × 账号权重因子。修改后立即热生效（无需重启）。'));
   var card=el('div','card');
   var wGroup=el('div','route-group');append(wGroup,el('div','route-group-title','评分权重'));
   var wRow=el('div','grid');
@@ -5708,7 +5725,12 @@ function renderRouting(root){
   var pRef=fieldInput('负载参考 loadReference',R.loadReference||4,'number');
   var pCf=fieldInput('额度换号上限 creditFailoverMax',R.creditFailoverMax!==undefined?R.creditFailoverMax:3,'number');
   var pCu=fieldInput('额度兜底阈值 creditUsageThreshold',R.creditUsageThreshold!==undefined?R.creditUsageThreshold:0.95,'number');
-  [pRef.el,pCf.el,pCu.el].forEach(function(x){quotaGrid.appendChild(x);});append(quotaGroup,quotaGrid);append(card,quotaGroup);
+  var pQw=fieldInput('额度权重 quota',(R.weights&&R.weights.quota!==undefined?R.weights.quota:0.2)*100,'number');
+  pQw.inp.min=0;pQw.inp.max=100;pQw.inp.step=0.01;
+  var pQf=fieldInput('额度衰减阈值 quotaFloor',R.quotaFloor!==undefined?R.quotaFloor:0.2,'number');
+  var pQu=fieldInput('额度未知分 quotaUnknownScore',R.quotaUnknownScore!==undefined?R.quotaUnknownScore:1,'number');
+  [pQf.inp,pQu.inp].forEach(function(x){x.min=0;x.max=1;x.step=0.01;});
+  [pRef.el,pCf.el,pCu.el,pQw.el,pQf.el,pQu.el].forEach(function(x){quotaGrid.appendChild(x);});append(quotaGroup,quotaGrid);append(card,quotaGroup);
   append(card,el('h3',null,'策略预览（按当前滑杆值实时计算）'));
   var prevBox=el('div');append(card,prevBox);
   var err=el('div','err');append(card,err);
@@ -5729,7 +5751,9 @@ function renderRouting(root){
       failureCooldownThreshold:Number(pTh.inp.value),
       creditFailoverMax:Number(pCf.inp.value),
       creditUsageThreshold:Number(pCu.inp.value),
-      weights:{successRate:Number(sS.inp.value)/100,latency:Number(sL.inp.value)/100,load:Number(sC.inp.value)/100}
+      quotaFloor:Number(pQf.inp.value),
+      quotaUnknownScore:Number(pQu.inp.value),
+      weights:{successRate:Number(sS.inp.value)/100,latency:Number(sL.inp.value)/100,load:Number(sC.inp.value)/100,quota:Number(pQw.inp.value)/100}
     };
     api('/admin/api/routing',{method:'PUT',body:body}).then(function(){toast('路由配置已更新','ok');refresh(true);})
       .catch(function(e){err.textContent=(e&&e.message)?e.message:'保存失败';});
@@ -5737,20 +5761,23 @@ function renderRouting(root){
   append(card,act);
   root.appendChild(card);
   function updatePreview(){
-    var ws=Number(sS.inp.value),wl=Number(sL.inp.value),wc=Number(sC.inp.value);
-    var sum=ws+wl+wc;
-    norm.textContent='归一化权重：成功率 '+(sum>0?(ws/sum*100).toFixed(1):'0')+'% · 延迟 '+(sum>0?(wl/sum*100).toFixed(1):'0')+'% · 负载 '+(sum>0?(wc/sum*100).toFixed(1):'0')+'%';
+    var ws=Number(sS.inp.value),wl=Number(sL.inp.value),wc=Number(sC.inp.value),wq=Number(pQw.inp.value);
+    var qf=Math.min(1,Math.max(0,Number(pQf.inp.value))),qu=Math.min(1,Math.max(0,Number(pQu.inp.value)));
+    var sum=ws+wl+wc+wq;
+    norm.textContent='归一化权重：成功率 '+(sum>0?(ws/sum*100).toFixed(1):'0')+'% · 延迟 '+(sum>0?(wl/sum*100).toFixed(1):'0')+'% · 负载 '+(sum>0?(wc/sum*100).toFixed(1):'0')+'% · 额度 '+(sum>0?(wq/sum*100).toFixed(1):'0')+'%';
     clear(prevBox);
     var acc=(S.metrics&&S.metrics.accounts)||[];
     var maxW=0;acc.forEach(function(a){if(a.enabled&&a.weight>maxW)maxW=a.weight;});
     var tbl=el('table');var thead=el('thead');var tr=el('tr');
-    ['账号','成功率S','延迟L','负载C','权重因子','评分','状态'].forEach(function(x){append(tr,el('th',null,x));});
+    ['账号','成功率S','延迟L','负载C','额度Q / 剩余','权重因子','评分','状态'].forEach(function(x){append(tr,el('th',null,x));});
     append(thead,tr);append(tbl,thead);
     var tb=el('tbody');
     acc.forEach(function(a){
       var cp=a.components||{};
       var s=sum>0?sum:1;
-      var base=(ws/s)*(cp.success||0)+(wl/s)*(cp.latency||0)+(wc/s)*(cp.load||0);
+      var remaining=Number.isFinite(cp.remaining)?cp.remaining:null;
+      var quota=qf===0?0:(remaining===null?qu:(remaining>=qf?1:Math.min(1,Math.max(0,remaining/Math.max(qf,1e-6)))));
+      var base=(ws/s)*(cp.success||0)+(wl/s)*(cp.latency||0)+(wc/s)*(cp.load||0)+(wq/s)*quota;
       var wf=maxW>0?(a.weight/maxW):1;
       var sc=a.cooling?0:base*wf;
       var r=el('tr');
@@ -5758,6 +5785,7 @@ function renderRouting(root){
       append(r,el('td','num',(cp.success!==undefined?cp.success:0).toFixed(3)));
       append(r,el('td','num',(cp.latency!==undefined?cp.latency:0).toFixed(3)));
       append(r,el('td','num',(cp.load!==undefined?cp.load:0).toFixed(3)));
+      append(r,el('td','num',quota.toFixed(3)+' / '+(remaining===null?'未知':(remaining*100).toFixed(1)+'%')));
       append(r,el('td','num',wf.toFixed(2)));
       append(r,el('td','num',sc.toFixed(3)));
       var previewState=a.cooling?'冷却':(a.enabled?'正常':'禁用');var previewCell=el('td');append(previewCell,statusBadge(previewState,a.cooling?'red':(a.enabled?'green':'gray')));append(r,previewCell);
@@ -5768,6 +5796,7 @@ function renderRouting(root){
   sS.inp.addEventListener('input',updatePreview);
   sL.inp.addEventListener('input',updatePreview);
   sC.inp.addEventListener('input',updatePreview);
+  [pQw.inp,pQf.inp,pQu.inp].forEach(function(x){x.addEventListener('input',updatePreview);});
   updatePreview();
 }
 
@@ -6217,7 +6246,8 @@ async function handleAdmin(req, res, url) {
           const cur = STORE.routing.weights;
           const sum = Number(body.weights.successRate ?? cur.successRate)
             + Number(body.weights.latency ?? cur.latency)
-            + Number(body.weights.load ?? cur.load);
+            + Number(body.weights.load ?? cur.load)
+            + Number(body.weights.quota ?? cur.quota);
           if (!(sum > 0)) return fail(400, 'routing weights must sum to a positive value', 'invalid_request');
         }
         const next = applyRouting(body);   // 字段级 merge + 原地赋值（热生效，不换引用）
