@@ -975,13 +975,13 @@ const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 // 进程内全局兜底，不替代下游方案，也不感知客户端身份。
 // 内存 = 在途数 × (0.13MB + 5.5 × body_MB)：body 上限只管住单请求量级，乘数由本项封顶。
 // 超限返回 503 + Retry-After（SDK 会自行退避重试），而不是放任进程被 OOM 杀掉。
-// 默认 0 = 关闭，不限制并发（既有的反代层定位不变，行为零变化）；需要时按需开启：
+// 默认 32；显式设 0 可关闭并发限制：
 //   CC_MAX_INFLIGHT=32 npm start
 // 注意：body 上限只管住单请求量级，乘数由本项封顶。默认 body 上限 100MB 时，
 // N × 最坏 550MB —— 要硬性内存上界需同时下调 CC_MAX_BODY_MB。
 const MAX_INFLIGHT = (() => {
   const n = Number.parseInt(process.env.CC_MAX_INFLIGHT ?? '', 10);
-  return Number.isFinite(n) && n > 0 ? n : 0;            // 默认 0 = 不限
+  return Number.isFinite(n) && n >= 0 ? n : 32;
 })();
 
 let inflightCount = 0;   // 当前在途请求数（不含 /health）
@@ -1907,7 +1907,32 @@ function mapCcEventError(event) {
 
 // ── HTTP 请求处理 ──────────────────────────────────
 
-function readBody(req) {
+function closeUnreadRequest(req, res) {
+  res.setHeader('Connection', 'close');
+  res.once('finish', () => req.destroy());
+}
+
+function bodySizeError(req, bytes, known) {
+  const mb = Math.round(MAX_BODY_SIZE / 1024 / 1024);
+  const sizeNote = ` (body is ${(bytes / 1048576).toFixed(1)}MB${known ? '' : '+'})`;
+  log('warn', 'Request body rejected (too large)', {
+    path: req.url,
+    limitMB: mb,
+    bodyMB: +(bytes / 1048576).toFixed(1),
+    exact: known,
+  });
+  const err = new Error(`Request body exceeds ${mb}MB limit${sizeNote}`);
+  err.statusCode = 413;
+  err.bodyBytes = bytes;
+  return err;
+}
+
+function readBody(req, res) {
+  const declared = Number.parseInt(req.headers['content-length'] ?? '', 10);
+  if (declared > MAX_BODY_SIZE) {
+    closeUnreadRequest(req, res);
+    return Promise.reject(bodySizeError(req, declared, true));
+  }
   return new Promise((resolve, reject) => {
     const chunks = [];
     let totalSize = 0;
@@ -1927,24 +1952,12 @@ function readBody(req) {
       if (totalSize > MAX_BODY_SIZE) {
         settled = true;
         chunks.length = 0;
-        const mb = Math.round(MAX_BODY_SIZE / 1024 / 1024);
         // 只报上限等于让人去猜自己超了多少 —— 客户端要据此决定"拆请求"还是"去申请提额"。
         // nginx 开了 proxy_request_buffering 时会带 Content-Length，据此给出真实体积；
         // 没有该头（chunked）时退回"已收到多少"，并标注它是下界。
-        const declared = Number.parseInt(req.headers['content-length'] ?? '', 10);
         const known = Number.isFinite(declared) && declared > 0;
         const bytes = known ? declared : totalSize;
-        const sizeNote = ` (body is ${(bytes / 1048576).toFixed(1)}MB${known ? '' : '+'})`;
-        log('warn', 'Request body rejected (too large)', {
-          path: req.url,
-          limitMB: mb,
-          bodyMB: +(bytes / 1048576).toFixed(1),
-          exact: known,
-        });
-        const err = new Error(`Request body exceeds ${mb}MB limit${sizeNote}`);
-        err.statusCode = 413;
-        err.bodyBytes = bytes;
-        reject(err);
+        reject(bodySizeError(req, bytes, known));
         return;
       }
       chunks.push(c);
@@ -2217,18 +2230,6 @@ async function forwardToCC(body, apiKey, incomingHeaders = {}, signal, promptCac
 // ── 路由 ────────────────────────────────────────────
 
 async function handleChatCompletions(req, res) {
-  let openaiReq;
-  try {
-    openaiReq = await readBody(req);
-  } catch (e) {
-    if (e.statusCode === 413) {
-      sendJSON(res, 413, { error: { message: e.message, type: 'invalid_request_error' } });
-      return;
-    }
-    sendJSON(res, 400, { error: { message: 'Invalid JSON body', type: 'invalid_request_error' } });
-    return;
-  }
-
   let route = resolveRoute(req.headers);
   if (route && route.error === 'no_available_account') {
     res.setHeader('Retry-After', '5');
@@ -2236,6 +2237,7 @@ async function handleChatCompletions(req, res) {
     return;
   }
   if (!route) {
+    closeUnreadRequest(req, res);
     sendJSON(res, 401, { error: { message: 'Missing API key. Send in Authorization: Bearer <key> or x-api-key header', type: 'auth_error' } });
     return;
   }
@@ -2244,6 +2246,18 @@ async function handleChatCompletions(req, res) {
   const startTime = Date.now();
   const markTtft = () => { if (outcome.ttftMs == null) outcome.ttftMs = Date.now() - startTime; };
   try {
+
+  let openaiReq;
+  try {
+    openaiReq = await readBody(req, res);
+  } catch (e) {
+    if (e.statusCode === 413) {
+      sendJSON(res, 413, { error: { message: e.message, type: 'invalid_request_error' } });
+      return;
+    }
+    sendJSON(res, 400, { error: { message: 'Invalid JSON body', type: 'invalid_request_error' } });
+    return;
+  }
 
   const stream = openaiReq.stream === true;
   const model = openaiReq.model || 'deepseek/deepseek-v4-flash';
@@ -3319,9 +3333,25 @@ function sendAnthropicError(res, status, type, message, retryAfter) {
 }
 
 async function handleMessages(req, res) {
+  let route = resolveRoute(req.headers);
+  if (route && route.error === 'no_available_account') {
+    res.setHeader('Retry-After', '5');
+    sendJSON(res, 503, { type: 'error', error: { type: 'no_available_account', message: 'No available upstream account for this token' }, retry_after: 5 });
+    return;
+  }
+  if (!route) {
+    closeUnreadRequest(req, res);
+    sendJSON(res, 401, { type: 'error', error: { type: 'authentication_error', message: 'Missing API key. Send in Authorization: Bearer <key> or x-api-key header' } });
+    return;
+  }
+  let apiKey = route.upstreamKey;
+  const outcome = { state: 'pending', ttftMs: null, status: null, code: null, message: null };
+
+  const startTime = Date.now();
+  try {
   let anthropicReq;
   try {
-    anthropicReq = await readBody(req);
+    anthropicReq = await readBody(req, res);
   } catch (e) {
     if (e.statusCode === 413) {
       sendAnthropicError(res, 413, 'invalid_request_error', e.message);
@@ -3330,19 +3360,6 @@ async function handleMessages(req, res) {
     sendAnthropicError(res, 400, 'invalid_request_error', 'Invalid JSON body');
     return;
   }
-
-  let route = resolveRoute(req.headers);
-  if (route && route.error === 'no_available_account') {
-    res.setHeader('Retry-After', '5');
-    sendJSON(res, 503, { type: 'error', error: { type: 'no_available_account', message: 'No available upstream account for this token' }, retry_after: 5 });
-    return;
-  }
-  if (!route) {
-    sendJSON(res, 401, { type: 'error', error: { type: 'authentication_error', message: 'Missing API key. Send in Authorization: Bearer <key> or x-api-key header' } });
-    return;
-  }
-  let apiKey = route.upstreamKey;
-  const outcome = { state: 'pending', ttftMs: null, status: null, code: null, message: null };
 
   const stream = anthropicReq.stream === true;
   const model = anthropicReq.model || 'claude-sonnet-4-6';
@@ -3358,7 +3375,6 @@ async function handleMessages(req, res) {
   const abortController = new AbortController();
   let aborted = false;
   // 提前初始化，断连回调/超时 catch 安全引用（避免块级作用域 ReferenceError）
-  const startTime = Date.now();
   const markTtft = () => { if (outcome.ttftMs == null) outcome.ttftMs = Date.now() - startTime; };
   let messageId = '';
   let reader = null;
@@ -3720,6 +3736,7 @@ async function handleMessages(req, res) {
       try { abortController.abort(); } catch {} // 打断 CC 上游
       sendAnthropicError(res, 502, 'proxy_error', `Upstream error: ${e.message}`, 10);
     }
+  }
   } finally {
     route.release(outcome, Date.now() - startTime);
   }
@@ -4365,9 +4382,26 @@ function createResponsesSseTranslator(model, responseId, created) {
 }
 
 async function handleResponses(req, res) {
+  let route = resolveRoute(req.headers);
+  if (route && route.error === 'no_available_account') {
+    res.setHeader('Retry-After', '5');
+    sendResponsesError(res, 503, 'no_available_account', 'No available upstream account for this token', 5);
+    return;
+  }
+  if (!route) {
+    closeUnreadRequest(req, res);
+    sendResponsesError(res, 401, 'authentication_error',
+      'Missing API key. Send in Authorization: Bearer <key> or x-api-key header');
+    return;
+  }
+  let apiKey = route.upstreamKey;
+  const outcome = { state: 'pending', ttftMs: null, status: null, code: null, message: null };
+
+  const startTime = Date.now();
+  try {
   let respReq;
   try {
-    respReq = await readBody(req);
+    respReq = await readBody(req, res);
   } catch (e) {
     if (e.statusCode === 413) { sendResponsesError(res, 413, 'invalid_request_error', e.message); return; }
     sendResponsesError(res, 400, 'invalid_request_error', 'Invalid JSON body');
@@ -4379,20 +4413,6 @@ async function handleResponses(req, res) {
       'previous_response_id is not supported (this proxy is stateless); send the full input each turn');
     return;
   }
-
-  let route = resolveRoute(req.headers);
-  if (route && route.error === 'no_available_account') {
-    res.setHeader('Retry-After', '5');
-    sendResponsesError(res, 503, 'no_available_account', 'No available upstream account for this token', 5);
-    return;
-  }
-  if (!route) {
-    sendResponsesError(res, 401, 'authentication_error',
-      'Missing API key. Send in Authorization: Bearer <key> or x-api-key header');
-    return;
-  }
-  let apiKey = route.upstreamKey;
-  const outcome = { state: 'pending', ttftMs: null, status: null, code: null, message: null };
 
   let chatReq = convertResponsesToChat(respReq);
   if (!chatReq.messages.length) {
@@ -4421,7 +4441,6 @@ async function handleResponses(req, res) {
 
   const abortController = new AbortController();
   let aborted = false;
-  const startTime = Date.now();
   const markTtft = () => { if (outcome.ttftMs == null) outcome.ttftMs = Date.now() - startTime; };
   let bytesReceived = 0;
   let lastCcEvent = '';
@@ -4746,6 +4765,7 @@ async function handleResponses(req, res) {
       try { res.write(translator ? translator.errorEvent(e.message) : ''); } catch (e2) {}
       try { res.end(); } catch (e2) {}
     }
+  }
   } finally {
     route.release(outcome, Date.now() - startTime);
   }
@@ -6348,7 +6368,13 @@ async function handleAdmin(req, res, url) {
 
 const server = http.createServer(async (req, res) => {
   const host = req.headers.host || 'localhost';
-  const url = new URL(req.url, `http://${host}`);
+  const url = new URL(req.url, 'http://localhost');
+  const authority = host.match(/^(?:\[[0-9a-fA-F:.]+\]|[^\s/?#:@[\]\\]+)(?::([0-9]+))?$/);
+  if (!authority || (authority[1] !== undefined && Number(authority[1]) > 65535)) {
+    closeUnreadRequest(req, res);
+    sendJSON(res, 400, { error: { message: 'Invalid Host header', type: 'invalid_request_error' } });
+    return;
+  }
   const isAdminPath = url.pathname === '/admin' || url.pathname.startsWith('/admin/');
 
   // CORS：仅数据面发 ACAO:*。管理面同源自定义头不触发预检，避免引入 CSRF 面。
@@ -6476,6 +6502,9 @@ server.listen(CFG.port, CFG.host, () => {
   });
   if (CLIENT_DRAIN_TIMEOUT_MS > 0) {
     log('info', 'Client drain timeout enabled', { timeoutMs: CLIENT_DRAIN_TIMEOUT_MS });
+  }
+  if (MAX_INFLIGHT === 0) {
+    log('warn', 'CC_MAX_INFLIGHT=0 disables the concurrency limit: unlimited requests pose a memory exhaustion risk');
   }
   // 内存提示：body 上限隐含的最坏内存 = 上限 × 实测放大系数（见 MAX_BODY_SIZE 注释 / issue #20）
   const bodyCapMB = Math.round(MAX_BODY_SIZE / 1048576);
