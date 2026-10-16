@@ -598,7 +598,7 @@ function releaseAccount(accountId, outcome, latencyMs) {
  *
  * forward: async (apiKey) => Response  —— 负责 ensureInitialized + forwardToCC 的重放闭包。
  */
-async function creditFailover({ route, apiKey, ccResponse, errorText, mapped, outcome, req, forward }) {
+async function creditFailover({ route, apiKey, ccResponse, errorText, mapped, outcome, req, forward, abortController }) {
   const routing = STORE.routing;
   const cur = { route, apiKey, ccResponse, errorText, mapped, creditExhausted: false, windowExhausted: false };
   const tried = new Set(route && route.accountId ? [route.accountId] : []);
@@ -654,7 +654,11 @@ async function creditFailover({ route, apiKey, ccResponse, errorText, mapped, ou
     try {
       cur.ccResponse = await forward(next.upstreamKey);
     } catch (e) {
-      next.release({ state: 'fail', status: 502, message: 'Upstream forwarding failed' }, null);
+      if (e.name === 'AbortError' || abortController?.signal?.aborted) {
+        next.release({ state: 'aborted' }, null);
+      } else {
+        next.release({ state: 'fail', status: 502, message: 'Upstream forwarding failed' }, null);
+      }
       throw e;
     }
     cur.errorText = cur.ccResponse.ok ? '' : await cur.ccResponse.text().catch(() => '');
@@ -1089,7 +1093,7 @@ function getOrCreateKeyState(apiKey, pooled = false) {
       lastSeen: 0,
     };
     log('info', 'Fingerprint derived for key', {
-      keyPrefix: apiKey.slice(0, 8),
+      keyHash: crypto.createHash('sha256').update(apiKey).digest('hex').slice(0, 8),
       thumbmark: state.fingerprint.thumbmark.slice(0, 12),
     });
   }
@@ -2395,7 +2399,7 @@ async function handleChatCompletions(req, res) {
       let mapped = mapCcError(ccResponse.status, errorText);
       // 额度耗尽 → 换号重放（客户端无感）；其余错误照旧返回
       const fo = await creditFailover({
-        route, apiKey, ccResponse, errorText, mapped, outcome, req,
+        route, apiKey, ccResponse, errorText, mapped, outcome, req, abortController,
         forward: async (key) => {
           await ensureInitialized(key, abortController.signal);
           return forwardToCC(ccBody, key, req.headers, abortController.signal, promptCacheKey);
@@ -3374,6 +3378,39 @@ async function handleMessages(req, res) {
   const outcome = { state: 'pending', ttftMs: null, status: null, code: null, message: null };
 
   const startTime = Date.now();
+  const abortController = new AbortController();
+  let aborted = false;
+  let stream = false;
+  let model = 'claude-sonnet-4-6';
+  const markTtft = () => { if (outcome.ttftMs == null) outcome.ttftMs = Date.now() - startTime; };
+  let messageId = '';
+  let reader = null;
+  let bytesReceived = 0; let lastCcEvent = ''; let fullText = '';
+
+  res.on('close', () => {
+    if (res.writableEnded) return;
+    aborted = true;
+    if (outcome.state === 'pending') outcome.state = 'aborted';
+    if (!abortController.signal.aborted) {
+      try {
+        res.write(`event: message_delta\ndata: ${JSON.stringify({
+          type: 'message_delta',
+          delta: { stop_reason: 'end_turn' },
+          usage: { output_tokens: 0, input_tokens: 0, cache_read_input_tokens: 0 },
+        })}\n\n`);
+        res.write(`event: message_stop\ndata: ${JSON.stringify({ type: 'message_stop' })}\n\n`);
+      } catch {}
+      try { abortController.abort(); } catch {}
+    }
+    log('warn', 'Client disconnected', {
+      path: '/v1/messages',
+      model,
+      messageId,
+      streaming: stream,
+      elapsedMs: Date.now() - startTime,
+    });
+  });
+
   try {
   let anthropicReq;
   try {
@@ -3387,8 +3424,8 @@ async function handleMessages(req, res) {
     return;
   }
 
-  const stream = anthropicReq.stream === true;
-  const model = anthropicReq.model || 'claude-sonnet-4-6';
+  stream = anthropicReq.stream === true;
+  model = anthropicReq.model || 'claude-sonnet-4-6';
 
   // Convert Anthropic → OpenAI → CC
   let openaiReq = convertAnthropicToOpenAI(anthropicReq);
@@ -3397,14 +3434,6 @@ async function handleMessages(req, res) {
   // 显式断开以便尽早回收 —— 否则它们会和 ccBody 一起活到整段请求结束。
   openaiReq = null;
   anthropicReq = null;
-
-  const abortController = new AbortController();
-  let aborted = false;
-  // 提前初始化，断连回调/超时 catch 安全引用（避免块级作用域 ReferenceError）
-  const markTtft = () => { if (outcome.ttftMs == null) outcome.ttftMs = Date.now() - startTime; };
-  let messageId = '';
-  let reader = null;
-  let bytesReceived = 0; let lastCcEvent = ''; let fullText = '';
 
   try {
     // 首次初始化（fingerprint + lifecycle）
@@ -3415,7 +3444,7 @@ async function handleMessages(req, res) {
       let errorText = await ccResponse.text().catch(() => '');
       let mapped = mapCcError(ccResponse.status, errorText);
       const fo = await creditFailover({
-        route, apiKey, ccResponse, errorText, mapped, outcome, req,
+        route, apiKey, ccResponse, errorText, mapped, outcome, req, abortController,
         forward: async (key) => {
           await ensureInitialized(key, abortController.signal);
           return forwardToCC(ccBody, key, req.headers, abortController.signal);
@@ -3435,32 +3464,6 @@ async function handleMessages(req, res) {
         return;
       }
     }
-
-    // 下游断连检测：打断 CC 上游 + 记录日志
-    res.on('close', () => {
-      if (res.writableEnded) return; // Normal completion, not a disconnect
-      aborted = true;
-      if (outcome.state === 'pending') outcome.state = 'aborted';
-      if (!abortController.signal.aborted) {
-        // 断连前抢发 usage=0 终止事件，避免下游自行估算 token
-        try {
-          res.write(`event: message_delta\ndata: ${JSON.stringify({
-            type: 'message_delta',
-            delta: { stop_reason: 'end_turn' },
-            usage: { output_tokens: 0, input_tokens: 0, cache_read_input_tokens: 0 },
-          })}\n\n`);
-          res.write(`event: message_stop\ndata: ${JSON.stringify({ type: 'message_stop' })}\n\n`);
-        } catch {}
-        try { abortController.abort(); } catch {}
-      }
-      log('warn', 'Client disconnected', {
-        path: '/v1/messages',
-        model,
-        messageId,
-        streaming: stream,
-        elapsedMs: Date.now() - startTime,
-      });
-    });
 
     if (stream) {
       // ── 流式 Anthropic SSE ──
@@ -4492,7 +4495,7 @@ async function handleResponses(req, res) {
       let errorText = await ccResponse.text().catch(() => '');
       let mapped = mapCcError(ccResponse.status, errorText);
       const fo = await creditFailover({
-        route, apiKey, ccResponse, errorText, mapped, outcome, req,
+        route, apiKey, ccResponse, errorText, mapped, outcome, req, abortController,
         forward: async (key) => {
           await ensureInitialized(key, abortController.signal);
           return forwardToCC(ccBody, key, req.headers, abortController.signal, promptCacheKey);
@@ -5285,6 +5288,7 @@ td{font-variant-numeric:tabular-nums}
   header#bar .brand{grid-area:brand;min-width:0}
   header#bar .stats{grid-area:stats;min-width:0;max-width:100%;flex-wrap:nowrap;overflow-x:auto;scrollbar-width:none}
   header#bar .stats::-webkit-scrollbar{display:none}
+  header#bar .stats.has-more{mask-image:linear-gradient(90deg,#000 calc(100% - 24px),transparent);-webkit-mask-image:linear-gradient(90deg,#000 calc(100% - 24px),transparent)}
   header#bar .stat{flex:0 0 auto}
   header#bar .spacer{display:none}
   header#bar .theme-toggle{grid-area:theme;min-width:40px;min-height:40px}
@@ -5490,6 +5494,11 @@ function logout(){token='';try{sessionStorage.removeItem(TKEY);}catch(e){}showAu
 function render(){renderStats();renderTabs();renderView();}
 
 function stat(k,v){var s=el('span','stat');append(s,el('span','sk',k),el('b',null,String(v)));return s;}
+function updateStatsOverflow(){
+  var w=byId('stats');
+  if(w.scrollWidth>w.clientWidth&&(w.scrollLeft||0)+w.clientWidth<w.scrollWidth-1)w.classList.add('has-more');
+  else w.classList.remove('has-more');
+}
 function renderStats(){
   var w=byId('stats');clear(w);
   var m=S.metrics||{};var t=m.totals||{};
@@ -5502,6 +5511,7 @@ function renderStats(){
   var p=el('span','stat',m.persistence===false?'仅内存（持久化失败）':'持久化正常');
   if(m.persistence===false)p.className='stat bad';
   append(w,p);
+  updateStatsOverflow();
 }
 function renderTabs(){
   var tabs=byId('tabs').children;
@@ -6023,6 +6033,8 @@ function initTheme(){
 function boot(){
   initTheme();
   byId('logout').onclick=logout;
+  byId('stats').addEventListener('scroll',updateStatsOverflow);
+  if(typeof window!=='undefined')window.addEventListener('resize',updateStatsOverflow);
   var tabs=byId('tabs').children;
   for(var i=0;i<tabs.length;i++){
     (function(b){b.onclick=function(){S.tab=b.getAttribute('data-tab');renderTabs();renderView();resumePolling();};})(tabs[i]);
@@ -6486,7 +6498,9 @@ const server = http.createServer(async (req, res) => {
       sendJSON(res, 404, { error: { message: 'Not found', type: 'not_found' } });
     }
   } catch (e) {
-    sendJSON(res, 500, { error: { message: e.message, type: 'internal_error' } });
+    const requestId = randomUUID();
+    log('error', 'Data API error', { requestId, method: req.method, path: url.pathname, message: e.message });
+    sendJSON(res, 500, { error: { message: 'Internal error', type: 'internal_error' }, request_id: requestId });
   }
 });
 
