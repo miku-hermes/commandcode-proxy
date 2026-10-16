@@ -10,6 +10,8 @@ import { fileURLToPath } from 'node:url';
 
 export const REPO = dirname(fileURLToPath(import.meta.url)).replace(/[/\\]test$/, '');
 
+const START_RETRIES = 5;
+
 // ── 挂起保护 ──────────────────────────────────────────────
 // 不能用 --test-timeout：Node 18 没有该选项（20.11 才加入），加了会让
 // engines 下限直接跑不起来。改用启动一个 unref 的定时器，进程若因泄漏
@@ -55,7 +57,7 @@ export async function closeServer(server, timeoutMs = 3000) {
 
 /** 启动一个 mock 上游。ndjson 为要回给代理的 CC NDJSON 行数组。 */
 export async function startMockUpstream(opts = {}) {
-  const port = await allocPort();
+  let port;
   const seen = [];
   const server = http.createServer((req, res) => {
     const chunks = [];
@@ -85,7 +87,28 @@ export async function startMockUpstream(opts = {}) {
       res.end();
     });
   });
-  await new Promise(r => server.listen(port, '127.0.0.1', r));
+  for (let retry = 0; ; retry++) {
+    port = await allocPort();
+    try {
+      await new Promise((resolve, reject) => {
+        const onError = error => {
+          server.removeListener('error', onError);
+          server.removeListener('listening', onListening);
+          reject(error);
+        };
+        const onListening = () => {
+          server.removeListener('error', onError);
+          resolve();
+        };
+        server.once('error', onError);
+        server.once('listening', onListening);
+        try { server.listen(port, '127.0.0.1'); } catch (error) { onError(error); }
+      });
+      break;
+    } catch (error) {
+      if (error.code !== 'EADDRINUSE' || retry >= START_RETRIES) throw error;
+    }
+  }
   return { port, seen, close: () => closeServer(server),
     // 最后一次 /alpha/generate 的请求体（wire 层断言的主要入口）
     lastGenerate: () => {
@@ -97,6 +120,16 @@ export async function startMockUpstream(opts = {}) {
 
 /** 在临时 cwd 中启动代理（复刻真实部署：proxy.mjs 与 config.json 同目录）。 */
 export async function startProxy({ upstreamPort, env = {}, cwd } = {}) {
+  for (let retry = 0; ; retry++) {
+    try {
+      return await startProxyOnce({ upstreamPort, env, cwd });
+    } catch (error) {
+      if (error.code !== 'EADDRINUSE' || retry >= START_RETRIES) throw error;
+    }
+  }
+}
+
+async function startProxyOnce({ upstreamPort, env, cwd }) {
   const port = await allocPort();
   const logs = [];
   // 自建的临时工作目录用完必须删；调用方传了 cwd 则由调用方负责。
@@ -116,6 +149,7 @@ export async function startProxy({ upstreamPort, env = {}, cwd } = {}) {
   });
   child.stdout.on('data', d => logs.push(d.toString()));
   child.stderr.on('data', d => logs.push(d.toString()));
+  const closed = new Promise(resolve => child.once('close', resolve));
 
   const base = 'http://127.0.0.1:' + port;
   let up = false;
@@ -124,7 +158,15 @@ export async function startProxy({ upstreamPort, env = {}, cwd } = {}) {
     try { const r = await fetch(base + '/health'); if (r.ok) { up = true; break; } } catch {}
     await sleep(125);
   }
-  if (!up) { child.kill(); throw new Error('proxy did not start:\n' + logs.join('')); }
+  if (!up) {
+    const exitedDuringHealth = child.exitCode !== null || child.signalCode !== null;
+    child.kill();
+    await closed;
+    if (ownWorkdir) rmSync(workdir, { recursive: true, force: true });
+    const error = new Error('proxy did not start:\n' + logs.join(''));
+    if (exitedDuringHealth && logs.join('').includes('EADDRINUSE')) error.code = 'EADDRINUSE';
+    throw error;
+  }
 
   return {
     port, base, child, logs: () => logs.join(''), workdir,
