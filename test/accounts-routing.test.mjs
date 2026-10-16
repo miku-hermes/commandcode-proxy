@@ -121,12 +121,18 @@ test('池路由：client 令牌请求 → 上游收到池账号 key，且不等�
 });
 
 // ── 7. 加权偏好健康账号 + 坏账号进冷却 ─────────────────────
-test('加权偏好健康账号：A 恒 429、B 正常，12 次后 B 占绝大多数且 A 进冷却', async () => {
+test('加权偏好健康账号：A 恒 429、B 正常，最多 40 次内 A 进冷却且 B 承接后续流量', async () => {
   await withSetup(badKeyMock(), async ({ proxy, mock }) => {
     await addAccount(proxy, { name: 'A', apiKey: 'user_bad_A' });
     await addAccount(proxy, { name: 'B', apiKey: 'user_good_B' });
     const cli = await addClient(proxy, { name: 'c' });
-    for (let i = 0; i < 12; i++) {
+    // 随机选中 A 三次才触发冷却；补发一达阈值就停，预留九次冷却后的独立观测。
+    // 总计最多 40 次，既保留 b >= 9，也不因刚好 a === 3 就放过冷却/降权回归：
+    // 后续若仍选中 A，a 会超过 3，原断言仍会红（随机选择不保证回归必然命中）。
+    for (let attempt = 0; attempt < 31 && countAuth(mock, 'bad_') < 3; attempt++) {
+      await proxy.post('/v1/chat/completions', CHAT, { Authorization: 'Bearer ' + cli.token });
+    }
+    for (let attempt = 0; attempt < 9; attempt++) {
       await proxy.post('/v1/chat/completions', CHAT, { Authorization: 'Bearer ' + cli.token });
     }
     const a = countAuth(mock, 'bad_');
@@ -146,7 +152,9 @@ test('reset-metrics 后冷却清除，账号重新获流', async () => {
     const A = await addAccount(proxy, { name: 'A', apiKey: 'user_bad_A' });
     await addAccount(proxy, { name: 'B', apiKey: 'user_good_B' });
     const cli = await addClient(proxy, { name: 'c' });
-    for (let i = 0; i < 12; i++) await proxy.post('/v1/chat/completions', CHAT, { Authorization: 'Bearer ' + cli.token });
+    for (let attempt = 0; attempt < 40 && countAuth(mock, 'bad_') < 3; attempt++) {
+      await proxy.post('/v1/chat/completions', CHAT, { Authorization: 'Bearer ' + cli.token });
+    }
     assert.equal((await metrics(proxy)).accounts.find(x => x.name === 'A').cooling, true);
 
     const before = countAuth(mock, 'bad_');
@@ -154,7 +162,9 @@ test('reset-metrics 后冷却清除，账号重新获流', async () => {
     assert.equal(rr.status, 200);
     assert.equal((await metrics(proxy)).accounts.find(x => x.name === 'A').cooling, false);
 
-    for (let i = 0; i < 12; i++) await proxy.post('/v1/chat/completions', CHAT, { Authorization: 'Bearer ' + cli.token });
+    for (let attempt = 0; attempt < 40 && countAuth(mock, 'bad_') === before; attempt++) {
+      await proxy.post('/v1/chat/completions', CHAT, { Authorization: 'Bearer ' + cli.token });
+    }
     assert.ok(countAuth(mock, 'bad_') > before, 'reset account should receive traffic again');
   });
 });

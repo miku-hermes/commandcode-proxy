@@ -99,6 +99,7 @@ function defaultRouting() {
     countRateLimitAsFailure: true,
     penalizeAuthErrors: false,              // 401/403 是否计入失败
     creditFailoverMax: 3,                   // 单请求内最多换几个号重试（0 = 关闭换号）
+    windowFallbackCooldownMs: 600000,
     creditUsageThreshold: 0.95,             // 额度查询已用比例 ≥ 此值 + 上游报错 → 兜底判为额度耗尽
   };
 }
@@ -173,6 +174,7 @@ function normalizeRouting(raw) {
   r.cooldownBaseMs = clampNum(raw.cooldownBaseMs, d.cooldownBaseMs, 1000, 3600000);
   r.cooldownMaxMs = clampNum(raw.cooldownMaxMs, d.cooldownMaxMs, r.cooldownBaseMs, 86400000);
   r.failureCooldownThreshold = clampNum(raw.failureCooldownThreshold, d.failureCooldownThreshold, 1, 1000);
+  r.windowFallbackCooldownMs = clampNum(raw.windowFallbackCooldownMs, 600000, 60000, 3600000);
   r.countTimeoutsAsFailure = raw.countTimeoutsAsFailure !== false;
   r.countRateLimitAsFailure = raw.countRateLimitAsFailure !== false;
   r.penalizeAuthErrors = raw.penalizeAuthErrors === true;
@@ -288,6 +290,10 @@ function newRuntime() {
     cooldownLevel: 0,
     creditExhausted: false,
     creditResetAt: null,
+    windowExhausted: false,
+    windowResetAt: null,
+    windowKind: null,
+    windowBlockedUntil: 0,
     lastError: null,
     ewmaTtftMs: 0,
     lastLatencyMs: 0,
@@ -309,7 +315,12 @@ function resetRuntime(id) {
   next.inFlight = old.inFlight;
   next.creditExhausted = old.creditExhausted;
   next.creditResetAt = old.creditResetAt;
+  next.windowExhausted = old.windowExhausted;
+  next.windowResetAt = old.windowResetAt;
+  next.windowKind = old.windowKind;
+  next.windowBlockedUntil = old.windowBlockedUntil;
   if (old.creditExhausted) next.cooldownUntil = old.creditResetAt || 0;
+  else if (old.windowExhausted) next.cooldownUntil = old.windowBlockedUntil;
   runtime.set(id, next);
 }
 
@@ -328,6 +339,37 @@ function expireCreditBlock(r, now) {
     r.cooldownLevel = 0;
     r.consecutiveFailures = 0;
   }
+}
+
+function clearWindowBlock(r) {
+  if (!r.creditExhausted && r.cooldownUntil === r.windowBlockedUntil) r.cooldownUntil = 0;
+  r.windowExhausted = false;
+  r.windowResetAt = null;
+  r.windowKind = null;
+  r.windowBlockedUntil = 0;
+}
+
+function expireWindowBlock(r, now) {
+  if (r.windowExhausted && r.windowBlockedUntil <= now) clearWindowBlock(r);
+}
+
+function updateWindowBlock(r, limits, now) {
+  if (!limits || typeof limits !== 'object') return;
+  const exceeded = ['fiveHour', 'weekly'].filter(kind => limits[kind]?.exceeded === true);
+  if (!exceeded.length) {
+    if (r.windowExhausted) clearWindowBlock(r);
+    return;
+  }
+  const resetAtOf = kind => Number.isFinite(limits[kind].resetAt) && limits[kind].resetAt > 0
+    ? limits[kind].resetAt : null;
+  const kind = exceeded.reduce((later, candidate) => (resetAtOf(candidate) || 0) > (resetAtOf(later) || 0) ? candidate : later);
+  const resetAt = resetAtOf(kind);
+  const until = Math.min(resetAt > now ? resetAt : now + STORE.routing.windowFallbackCooldownMs, now + 3600000);
+  r.windowBlockedUntil = r.windowExhausted ? Math.min(r.windowBlockedUntil, until) : until;
+  r.windowExhausted = true;
+  r.windowKind = kind;
+  r.windowResetAt = resetAt;
+  if (!r.creditExhausted) r.cooldownUntil = r.windowBlockedUntil;
 }
 
 function pruneBuckets(r, now, routing) {
@@ -378,7 +420,7 @@ function scoreAccount(account, r, now, routing, maxWeight) {
   const wC = wsum > 0 ? routing.weights.load / wsum : 1 / 3;
   const base = wS * S + wL * L + wC * C;
   const weightFactor = maxWeight > 0 ? account.weight / maxWeight : 1;
-  const score = r.creditExhausted || r.cooldownUntil > now ? 0 : base * weightFactor;
+  const score = r.creditExhausted || r.windowExhausted || r.cooldownUntil > now ? 0 : base * weightFactor;
   return {
     score,
     components: {
@@ -409,7 +451,8 @@ function selectAccount(client) {
   const notSaturated = list.filter(a => {
     const r = getRuntime(a.id);
     expireCreditBlock(r, now);
-    return !r.creditExhausted && !(a.maxInflight > 0 && r.inFlight >= a.maxInflight);
+    expireWindowBlock(r, now);
+    return !r.creditExhausted && !r.windowExhausted && !(a.maxInflight > 0 && r.inFlight >= a.maxInflight);
   });
   const healthy = notSaturated.filter(a => getRuntime(a.id).cooldownUntil <= now);
   const cooling = notSaturated.filter(a => getRuntime(a.id).cooldownUntil > now);
@@ -475,7 +518,10 @@ function releaseAccount(accountId, outcome, latencyMs) {
   r.totals.requests++;
   const now = Date.now();
   const routing = STORE.routing;
-  const state = outcome && outcome.state;
+  const ignoreFailure = outcome && (outcome.timeout
+    ? !routing.countTimeoutsAsFailure
+    : outcome.status === 429 && !routing.countRateLimitAsFailure);
+  const state = outcome?.state === 'fail' && ignoreFailure ? 'neutral' : outcome && outcome.state;
   if (outcome && outcome.status != null) {
     r.lastError = { at: now, status: outcome.status, code: outcome.code || null, message: outcome.message || null };
   }
@@ -492,16 +538,22 @@ function releaseAccount(accountId, outcome, latencyMs) {
     if (outcome.retried) r.totals.retried++;
     r.consecutiveFailures = 0;
     r.cooldownLevel = 0;
-    if (!r.creditExhausted) r.cooldownUntil = 0;
+    if (!r.creditExhausted && !r.windowExhausted) r.cooldownUntil = 0;
   } else if (state === 'fail') {
     addSample(r, now, routing, 'fail', null);
     r.totals.fail++;
     r.consecutiveFailures++;
     if (r.consecutiveFailures >= routing.failureCooldownThreshold) {
       const backoff = Math.min(routing.cooldownBaseMs * Math.pow(2, r.cooldownLevel), routing.cooldownMaxMs);
-      if (!r.creditExhausted) r.cooldownUntil = now + backoff;
+      if (!r.creditExhausted && !r.windowExhausted) r.cooldownUntil = now + backoff;
       r.cooldownLevel++;
     }
+  } else if (state === 'window_exhausted') {
+    addSample(r, now, routing, 'fail', null);
+    r.totals.fail++;
+    r.consecutiveFailures++;
+    r.cooldownLevel = 0;
+    if (!r.creditExhausted) r.cooldownUntil = r.windowBlockedUntil;
   } else if (state === 'credit_exhausted') {
     // 仅套餐周期到期可恢复；未知重置时间保持硬阻断。
     addSample(r, now, routing, 'fail', null);
@@ -533,13 +585,14 @@ function releaseAccount(accountId, outcome, latencyMs) {
  */
 async function creditFailover({ route, apiKey, ccResponse, errorText, mapped, outcome, req, forward }) {
   const routing = STORE.routing;
-  const cur = { route, apiKey, ccResponse, errorText, mapped, creditExhausted: false };
+  const cur = { route, apiKey, ccResponse, errorText, mapped, creditExhausted: false, windowExhausted: false };
   const tried = new Set(route && route.accountId ? [route.accountId] : []);
   let switches = 0;
   while (cur.ccResponse && !cur.ccResponse.ok && cur.route.mode === 'pool') {
     const status = cur.ccResponse.status;
     cur.creditExhausted = isCreditExhaustedError(status, cur.mapped && cur.mapped.code, cur.errorText);
     outcome.creditResetAt = null;
+    cur.windowExhausted = false;
     if (cur.creditExhausted || status === 400 || status === 402 || status === 403) {
       const account = STORE.accounts.find(a => a.id === cur.route.accountId);
       if (account) {
@@ -547,12 +600,16 @@ async function creditFailover({ route, apiKey, ccResponse, errorText, mapped, ou
         const p = usage.credits && usage.credits.usagePercent;
         cur.creditExhausted = cur.creditExhausted || (usage.ok === true && typeof p === 'number'
           && Number.isFinite(p) && p >= routing.creditUsageThreshold);
-        if (cur.creditExhausted) outcome.creditResetAt = creditResetAtOf(usage);
+        const rt = getRuntime(account.id);
+        expireWindowBlock(rt, Date.now());
+        cur.windowExhausted = rt.windowExhausted;
+        if (cur.windowExhausted) cur.creditExhausted = false;
+        else if (cur.creditExhausted) outcome.creditResetAt = creditResetAtOf(usage);
       }
     }
-    if (!cur.creditExhausted || switches >= routing.creditFailoverMax) break;
+    if ((!cur.creditExhausted && !cur.windowExhausted) || switches >= routing.creditFailoverMax) break;
     // 1) 记账：当前账号额度耗尽 → 立即长冷却（不等连续失败阈值）
-    outcome.state = 'credit_exhausted';
+    outcome.state = cur.windowExhausted ? 'window_exhausted' : 'credit_exhausted';
     outcome.status = cur.ccResponse.status;
     outcome.code = (cur.mapped && cur.mapped.code) || null;
     outcome.message = (cur.mapped && cur.mapped.body && cur.mapped.body.error && cur.mapped.body.error.message) || null;
@@ -2292,7 +2349,7 @@ async function handleChatCompletions(req, res) {
       route = fo.route; apiKey = fo.apiKey; ccResponse = fo.ccResponse;
       errorText = fo.errorText; mapped = fo.mapped;
       if (!ccResponse.ok) {
-        outcome.state = fo.creditExhausted
+        outcome.state = fo.windowExhausted ? 'window_exhausted' : fo.creditExhausted
           ? 'credit_exhausted'
           : classifyUpstreamStatus(ccResponse.status);
         outcome.status = ccResponse.status;
@@ -2429,6 +2486,7 @@ async function handleChatCompletions(req, res) {
           // cancel() 返回 promise：不接住的话，连接已被对端掐断时会抛 UnhandledPromiseRejection
           try { reader.cancel().catch(() => {}); } catch {}
         } else if (e.message === 'STREAM_IDLE_TIMEOUT') {
+          outcome.timeout = true;
           outcome.state = 'fail';
           outcome.status = 429;
           log('warn', 'Stream idle timeout', {
@@ -2670,6 +2728,7 @@ async function handleChatCompletions(req, res) {
       });
       return; // 下游已断连：不再重试（res 已关闭）
     } else if (e.message === 'STREAM_IDLE_TIMEOUT') {
+      outcome.timeout = true;
       outcome.state = 'fail';
       outcome.status = 429;
       log('warn', 'Stream idle timeout', {
@@ -3308,7 +3367,7 @@ async function handleMessages(req, res) {
       route = fo.route; apiKey = fo.apiKey; ccResponse = fo.ccResponse;
       errorText = fo.errorText; mapped = fo.mapped;
       if (!ccResponse.ok) {
-        outcome.state = fo.creditExhausted
+        outcome.state = fo.windowExhausted ? 'window_exhausted' : fo.creditExhausted
           ? 'credit_exhausted'
           : classifyUpstreamStatus(ccResponse.status);
         outcome.status = ccResponse.status;
@@ -3434,6 +3493,7 @@ async function handleMessages(req, res) {
         if (aborted) {
           // 客户端已断连，只清理（close handler 已调用 abortController.abort()）
         } else if (e.message === 'STREAM_IDLE_TIMEOUT') {
+          outcome.timeout = true;
           outcome.state = 'fail';
           outcome.status = 429;
           log('warn', 'Stream idle timeout', {
@@ -3616,6 +3676,7 @@ async function handleMessages(req, res) {
         messageId,
       });
     } else if (e.message === 'STREAM_IDLE_TIMEOUT') {
+      outcome.timeout = true;
       outcome.state = 'fail';
       outcome.status = 429;
       log('warn', 'Stream idle timeout', {
@@ -4380,7 +4441,7 @@ async function handleResponses(req, res) {
       route = fo.route; apiKey = fo.apiKey; ccResponse = fo.ccResponse;
       errorText = fo.errorText; mapped = fo.mapped;
       if (!ccResponse.ok) {
-        outcome.state = fo.creditExhausted
+        outcome.state = fo.windowExhausted ? 'window_exhausted' : fo.creditExhausted
           ? 'credit_exhausted'
           : classifyUpstreamStatus(ccResponse.status);
         outcome.status = ccResponse.status;
@@ -4500,6 +4561,7 @@ async function handleResponses(req, res) {
         if (aborted) {
           try { reader.cancel().catch(() => {}); } catch (e2) {}
         } else if (e.message === 'STREAM_IDLE_TIMEOUT') {
+          outcome.timeout = true;
           outcome.state = 'fail';
           outcome.status = 429;
           log('warn', 'Stream idle timeout', {
@@ -4661,6 +4723,7 @@ async function handleResponses(req, res) {
   } catch (e) {
     if (e.name === 'AbortError' || e.code === 'ABORT_ERR') return;
     if (outcome.state === 'pending') { outcome.state = 'fail'; outcome.status = 502; }
+    if (e.message === 'STREAM_IDLE_TIMEOUT') outcome.timeout = true;
     log('error', 'Responses handler error', { message: e.message });
     if (!res.headersSent) {
       sendResponsesError(res, 502, 'proxy_error', 'Upstream error: ' + e.message, 10);
@@ -4864,6 +4927,7 @@ async function fetchAccountUsage(account) {
     usageJSON('/alpha/billing/credits' + q, account.apiKey),
     usageJSON('/alpha/billing/subscriptions' + q, account.apiKey),
   ]);
+  const top = (credRaw && (credRaw.data || credRaw)) || {};
   const creds = (credRaw && (credRaw.credits || (credRaw.data && credRaw.data.credits))) || {};
   const sub = (subRaw && (subRaw.data || subRaw)) || {};
   let summary = null;
@@ -4899,9 +4963,9 @@ async function fetchAccountUsage(account) {
       totalRemaining, totalSpent, totalPool,
       usagePercent: totalPool > 0 ? Math.min(1, Math.max(0, (totalPool - totalRemaining) / totalPool)) : 0,
       hasCreditsInfo: totalRemaining > 0 || totalSpent > 0,
-      windowLimits: creds.windowLimits || null,
-      sandboxMinutes: creds.sandboxMinutes !== undefined ? creds.sandboxMinutes : null,
-      sandboxAccess: creds.sandboxAccess === true,
+      windowLimits: top.windowLimits ?? creds.windowLimits ?? null,
+      sandboxMinutes: top.sandboxMinutes ?? creds.sandboxMinutes ?? null,
+      sandboxAccess: (top.sandboxAccess ?? creds.sandboxAccess) === true,
     },
     orgLimits: who.orgLimits || [],
   };
@@ -4917,6 +4981,8 @@ async function getAccountUsage(account, force) {
       const data = await fetchAccountUsage(account);
       view = { id: account.id, name: account.name, enabled: account.enabled, ...data };
       const rt = getRuntime(account.id);
+      expireWindowBlock(rt, Date.now());
+      updateWindowBlock(rt, view.credits.windowLimits, Date.now());
       const resetAt = creditResetAtOf(view);
       // 查询只补充套餐时间，不因余额变化解锁；已到期的周期交由选路解除。
       if (rt.creditExhausted && resetAt !== null
@@ -5412,12 +5478,12 @@ function selectField(labelText,opts,value){
   opts.forEach(function(o){var op=el('option',null,o[1]);op.value=o[0];if(o[0]===value)op.selected=true;s.appendChild(op);});
   append(l,s);return {el:l,inp:s};
 }
-function confirmDelete(msg,onYes){
+function confirmDelete(msg,onYes,confirmLabel){
   var ov=el('div','overlay');var box=el('div','modal');
   append(box,el('h2',null,'请确认'),el('p',null,msg));
   var act=el('div','actions');
   act.appendChild(mkbtn('取消',null,function(){document.body.removeChild(ov);}));
-  act.appendChild(mkbtn('确认删除','danger',function(){document.body.removeChild(ov);onYes();}));
+  act.appendChild(mkbtn(confirmLabel||'确认删除','danger',function(){document.body.removeChild(ov);onYes();}));
   append(box,act);append(ov,box);document.body.appendChild(ov);
 }
 
@@ -5453,6 +5519,10 @@ function accountCard(a,m){
   addRow(rows,'评分',(m&&m.score!==undefined)?m.score.toFixed(3):'—');
   addRow(rows,'冷却',(m&&m.cooling)?(m.creditResetUnknown?'套餐重置时间未知':('剩余 '+fmtDur(m.cooldownUntil-Date.now()))):'否');
   if(m&&m.creditExhausted)addRow(rows,'额度',m.creditResetAt?'耗尽（到套餐重置时间恢复：'+new Date(m.creditResetAt).toLocaleString()+'）':'耗尽（套餐重置时间未知，保持停用）');
+  if(m&&m.windowExhausted){
+    var windowName={fiveHour:'5 小时',weekly:'每周'}[m.windowKind]||m.windowKind||'未知';
+    addRow(rows,'窗口','窗口暂停（'+windowName+'，'+(m.windowResetAt?'到 '+new Date(m.windowResetAt).toLocaleString()+' 解除':'等待重置')+'）');
+  }
   c.appendChild(rows);
   if(m&&m.lastError){append(c,el('div','key','最后错误: '+(m.lastError.status||'')+' '+(m.lastError.code||m.lastError.message||'')));}
   var sw=el('label','switch');var cb=el('input');cb.type='checkbox';cb.checked=!!a.enabled;
@@ -5462,6 +5532,11 @@ function accountCard(a,m){
   append(act,mkbtn('编辑',null,function(){openAccountModal(a);}));
   append(act,mkbtn('测试',null,function(){testAccount(a,act);}));
   append(act,mkbtn('重置指标',null,function(){post('/admin/api/accounts/'+a.id+'/reset-metrics').then(function(){toast('指标已重置','ok');refresh();}).catch(function(e){toast('重置失败：'+(e&&e.message?e.message:String(e)),'err');});}));
+  if(m&&(m.creditExhausted||m.windowExhausted||m.cooling))append(act,mkbtn('解除阻断','danger',function(){
+    confirmDelete('解除「'+a.name+'」的额度/窗口阻断？解除后它会立即回到选路池；若上游仍然拒绝（账号确实耗尽），下一次请求会重新进入冷却。',function(){
+      post('/admin/api/accounts/'+a.id+'/clear-blocks').then(function(){toast('阻断已解除','ok');refresh();}).catch(function(e){toast('解除失败：'+e.message,'err');});
+    },'解除阻断');
+  }));
   append(act,mkbtn('删除','danger',function(){confirmDelete('删除账号「'+a.name+'」？此操作不可撤销。',function(){del('/admin/api/accounts/'+a.id).then(function(){toast('已删除','ok');refresh();});});}));
   c.appendChild(act);
   return c;
@@ -6031,6 +6106,31 @@ async function handleAdmin(req, res, url) {
         const view = await getAccountUsage(STORE.accounts[idx], url.searchParams.get('refresh') === '1');
         return adminJSON(res, 200, { usage: view });
       }
+
+      if (segs.length === 3 && segs[2] === 'clear-blocks' && method === 'POST') {
+        const account = STORE.accounts[idx];
+        const metrics = getRuntime(id);
+        const cleared = {
+          creditExhausted: metrics.creditExhausted,
+          creditResetAt: metrics.creditResetAt,
+          windowExhausted: metrics.windowExhausted,
+          windowKind: metrics.windowKind,
+          cooldownUntil: metrics.cooldownUntil,
+        };
+        metrics.creditExhausted = false;
+        metrics.creditResetAt = null;
+        metrics.windowExhausted = false;
+        metrics.windowResetAt = null;
+        metrics.windowKind = null;
+        metrics.windowBlockedUntil = 0;
+        metrics.cooldownUntil = 0;
+        metrics.cooldownLevel = 0;
+        metrics.consecutiveFailures = 0;
+        log('info', 'Admin: account blocks cleared', { accountId: id, name: account.name, cleared });
+        return adminJSON(res, 200, { ok: true, id, cleared });
+      }
+
+
       return fail(404, 'Not found', 'not_found');
     }
 
@@ -6147,9 +6247,10 @@ async function handleAdmin(req, res, url) {
       let healthy = 0, cooling = 0;
       const accounts = STORE.accounts.map(a => {
         const r = getRuntime(a.id);
+        expireWindowBlock(r, now);
         const st = windowStats(r, now, routing);
         const { score, components } = scoreAccount(a, r, now, routing, maxWeight);
-        if (a.enabled) { if (r.creditExhausted || r.cooldownUntil > now) cooling++; else healthy++; }
+        if (a.enabled) { if (r.creditExhausted || r.windowExhausted || r.cooldownUntil > now) cooling++; else healthy++; }
         return {
           id: a.id, name: a.name, enabled: a.enabled, weight: a.weight,
           score, components,
@@ -6158,7 +6259,11 @@ async function handleAdmin(req, res, url) {
           inFlight: r.inFlight,
           consecutiveFailures: r.consecutiveFailures,
           cooldownUntil: r.cooldownUntil,
-          cooling: r.creditExhausted || r.cooldownUntil > now,
+          cooling: r.creditExhausted || r.windowExhausted || r.cooldownUntil > now,
+          windowExhausted: !!r.windowExhausted,
+          windowResetAt: r.windowResetAt,
+          windowKind: r.windowKind,
+          windowBlockedUntil: r.windowBlockedUntil,
           creditExhausted: !!r.creditExhausted,
           creditResetAt: r.creditResetAt,
           creditBlocked: !!r.creditExhausted,
