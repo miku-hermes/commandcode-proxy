@@ -8,7 +8,7 @@ import { setup } from './helpers.mjs';
 
 const ADMIN_TOKEN = 'adm_panel_test';
 const ADMIN = { 'x-admin-token': ADMIN_TOKEN };
-const DEFAULT_PERCENT = { successRate: 50, latency: 30, load: 20 };
+const DEFAULT_PERCENT = { successRate: 50, latency: 30, load: 20, quota: 20 };
 
 async function withSetup(fn, routing) {
   const cwd = routing === undefined ? undefined : mkdtempSync(join(tmpdir(), 'ccp-panel-'));
@@ -44,7 +44,7 @@ async function putWeights(proxy, weights) {
   });
   assert.equal(response.status, 200);
   assert.deepEqual((await response.json()).routing.weights, {
-    ...weights, latency: Math.max(0, weights.latency),
+    ...weights, latency: Math.max(0, weights.latency), quota: Math.min(1000, Math.max(0, weights.quota)),
   });
 }
 
@@ -112,16 +112,18 @@ async function renderPanel(html, data) {
 
 test('路由权重：HTML 初值、实际滑块、归一化与预览同为百分比，保存仍为分数', async () => {
   await withSetup(async proxy => {
-    const weights = { successRate: 0.2, latency: 0.5, load: 0.3 };
-    const percent = { successRate: 20, latency: 50, load: 30 };
+    const weights = { successRate: 0.2, latency: 0.5, load: 0.3, quota: 0.2 };
+    const percent = { successRate: 20, latency: 50, load: 30, quota: 20 };
     await putWeights(proxy, weights);
     const { html, data } = await readPanel(proxy, weights, percent);
     const { nodes, requests } = await renderPanel(html, data);
     const sliders = nodes.filter(node => node.type === 'range');
-    assert.deepEqual(sliders.map(node => Number(node.value)), Object.values(percent));
-    assert.deepEqual(sliders.map(node => node.parentNode.children[2].textContent), ['20', '50', '30']);
-    assert.ok(nodes.some(node => node.textContent === '归一化权重：成功率 20.0% · 延迟 50.0% · 负载 30.0%'));
-    assert.ok(nodes.some(node => node.tagName === 'TD' && node.textContent === '0.540'));
+    const quota = nodes.find(node => node.children.some(child => child.textContent === '额度权重 quota'))
+      .children.find(node => node.tagName === 'INPUT');
+    assert.deepEqual([...sliders, quota].map(node => Number(node.value)), Object.values(percent));
+    assert.deepEqual([...sliders.map(node => node.parentNode.children[2].textContent), String(quota.value)], ['20', '50', '30', '20']);
+    assert.ok(nodes.some(node => node.textContent === '归一化权重：成功率 16.7% · 延迟 41.7% · 负载 25.0% · 额度 16.7%'));
+    assert.ok(nodes.some(node => node.tagName === 'TD' && node.textContent === '0.617'));
     nodes.find(node => node.tagName === 'BUTTON' && node.textContent === '保存路由配置').onclick();
     const saved = requests.find(request => request.options.method === 'PUT');
     assert.ok(saved, 'save button must submit routing');
@@ -133,12 +135,12 @@ test('路由权重：HTML 初值、实际滑块、归一化与预览同为百分
 });
 
 for (const [name, weights, expectedWeights, percent] of [
-  ['上边界', { successRate: 1, latency: 0, load: 0 }, { successRate: 1, latency: 0, load: 0 },
-    { successRate: 100, latency: 0, load: 0 }],
-  ['越界 clamp', { successRate: 1.4, latency: -1, load: 0.3 }, { successRate: 1.4, latency: 0, load: 0.3 },
-    { successRate: 100, latency: 0, load: 30 }],
-  ['取整', { successRate: 0.206, latency: 0.494, load: 0.3 }, { successRate: 0.206, latency: 0.494, load: 0.3 },
-    { successRate: 21, latency: 49, load: 30 }],
+  ['上边界', { successRate: 1, latency: 0, load: 0, quota: 0 }, { successRate: 1, latency: 0, load: 0, quota: 0 },
+    { successRate: 100, latency: 0, load: 0, quota: 0 }],
+  ['越界 clamp', { successRate: 1.4, latency: -1, load: 0.3, quota: 1001 }, { successRate: 1.4, latency: 0, load: 0.3, quota: 1000 },
+    { successRate: 100, latency: 0, load: 30, quota: 100 }],
+  ['取整', { successRate: 0.206, latency: 0.494, load: 0.3, quota: 0.206 }, { successRate: 0.206, latency: 0.494, load: 0.3, quota: 0.206 },
+    { successRate: 21, latency: 49, load: 30, quota: 21 }],
 ]) {
   test('路由权重百分比：' + name, async () => {
     await withSetup(async proxy => {
@@ -150,10 +152,10 @@ for (const [name, weights, expectedWeights, percent] of [
 
 for (const [name, routing] of [
   ['缺失 weights', {}],
-  ['非数字 weights', { weights: { successRate: 'invalid', latency: 'invalid', load: 'invalid' } }],
+  ['非数字 weights', { weights: { successRate: 'invalid', latency: 'invalid', load: 'invalid', quota: 'invalid' } }],
 ]) {
   test('路由权重百分比：' + name + ' 使用默认值', async () => {
     await withSetup(proxy => readPanel(proxy,
-      { successRate: 0.5, latency: 0.3, load: 0.2 }, DEFAULT_PERCENT), routing);
+      { successRate: 0.5, latency: 0.3, load: 0.2, quota: 0.2 }, DEFAULT_PERCENT), routing);
   });
 }

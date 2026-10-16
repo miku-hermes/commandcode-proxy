@@ -184,7 +184,7 @@ test('PUT /admin/api/routing 热改权重：200 且无需重启', async () => {
     assert.equal(live.status, 200);
     assert.equal(String(mock.lastGenerate().headers.authorization), 'Bearer user_test');
     // 非法权重和 → 400
-    const bad = await admin(proxy, 'PUT', '/admin/api/routing', { weights: { successRate: 0, latency: 0, load: 0 } });
+    const bad = await admin(proxy, 'PUT', '/admin/api/routing', { weights: { successRate: 0, latency: 0, load: 0, quota: 0 } });
     assert.equal(bad.status, 400);
   });
 });
