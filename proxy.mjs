@@ -374,7 +374,7 @@ function updateWindowBlock(r, limits, now) {
   const kind = exceeded.reduce((later, candidate) => (resetAtOf(candidate) || 0) > (resetAtOf(later) || 0) ? candidate : later);
   const resetAt = resetAtOf(kind);
   const until = Math.min(resetAt > now ? resetAt : now + STORE.routing.windowFallbackCooldownMs, now + 3600000);
-  r.windowBlockedUntil = r.windowExhausted ? Math.min(r.windowBlockedUntil, until) : until;
+  r.windowBlockedUntil = r.windowExhausted ? Math.max(r.windowBlockedUntil, until) : until;
   r.windowExhausted = true;
   r.windowKind = kind;
   r.windowResetAt = resetAt;
@@ -1072,32 +1072,58 @@ function isWireUuid(v) {
 // 只是下次多算一次 HMAC。淘汰按「空闲」而非「session 过期」判定，
 // 这样活跃 key 的 nextInitAt 不会被重置（否则会重复发送指纹/lifecycle 预请求）。
 const KEY_STATE_IDLE_MS = 24 * 60 * 60 * 1000; // 24h 未活动即淘汰
+const KEY_STATE_MAX = Math.trunc(clampNum(process.env.CC_KEY_STATE_MAX, 512, 16, 100000));
+const KEY_INIT_PER_MIN = Math.trunc(clampNum(process.env.CC_KEY_INIT_PER_MIN, 60, 0, Number.MAX_SAFE_INTEGER));
 const keyStateStore = new Map(); // apiKey → { fingerprint, nextInitAt, lastSeen }
+const poolKeyStateStore = new Map();
+const keyInitTimes = [];
 
-function getOrCreateKeyState(apiKey) {
-  let state = keyStateStore.get(apiKey);
+function getOrCreateKeyState(apiKey, pooled = false) {
+  const store = pooled ? poolKeyStateStore : keyStateStore;
+  let state = store.get(apiKey);
   if (!state) {
+    if (!pooled && store.size >= KEY_STATE_MAX) store.delete(store.keys().next().value);
     state = {
       fingerprint: generateFingerprint(apiKey),
       nextInitAt: 0,
       lastSeen: 0,
     };
-    keyStateStore.set(apiKey, state);
     log('info', 'Fingerprint derived for key', {
       keyPrefix: apiKey.slice(0, 8),
       thumbmark: state.fingerprint.thumbmark.slice(0, 12),
     });
   }
+  store.delete(apiKey);
+  store.set(apiKey, state);
   state.lastSeen = Date.now();
   return state;
+}
+
+async function initializeForRoute(route, res, signal) {
+  if (route.mode === 'legacy' && !keyStateStore.has(route.upstreamKey) && KEY_INIT_PER_MIN > 0) {
+    const now = Date.now();
+    while (keyInitTimes.length && keyInitTimes[0] <= now - 60000) keyInitTimes.shift();
+    if (keyInitTimes.length >= KEY_INIT_PER_MIN) {
+      const retryAfter = Math.max(1, Math.ceil((keyInitTimes[0] + 60000 - now) / 1000));
+      log('warn', 'Legacy key initialization rate limit reached', { count: keyInitTimes.length });
+      res.setHeader('Retry-After', String(retryAfter));
+      sendJSON(res, 429, { error: { message: 'Too many new legacy keys', type: 'rate_limit_error' }, retry_after: retryAfter });
+      return false;
+    }
+    keyInitTimes.push(now);
+  }
+  await ensureInitialized(route.upstreamKey, signal, route.mode === 'pool');
+  return true;
 }
 
 // 空闲淘汰：纯内存卫生，不影响设备身份（见上）
 setInterval(() => {
   const now = Date.now();
   let evicted = 0;
-  for (const [key, state] of keyStateStore) {
-    if (now - state.lastSeen > KEY_STATE_IDLE_MS) { keyStateStore.delete(key); evicted++; }
+  for (const store of [keyStateStore, poolKeyStateStore]) {
+    for (const [key, state] of store) {
+      if (now - state.lastSeen > KEY_STATE_IDLE_MS) { store.delete(key); evicted++; }
+    }
   }
   if (evicted > 0) log('info', 'Key state evicted (idle)', { evicted, remaining: keyStateStore.size });
 }, 60 * 60 * 1000); // 每小时
@@ -1106,8 +1132,8 @@ setInterval(() => {
 const INIT_REFRESH_MS = 8 * 60 * 60 * 1000;    // 8h
 const INIT_JITTER_MS  = 2 * 60 * 60 * 1000;    // 2h 抖动
 
-async function ensureInitialized(apiKey, signal) {
-  const state = getOrCreateKeyState(apiKey);
+async function ensureInitialized(apiKey, signal, pooled = true) {
+  const state = getOrCreateKeyState(apiKey, pooled);
   const now = Date.now();
   if (now < state.nextInitAt) return;
 
@@ -2360,7 +2386,7 @@ async function handleChatCompletions(req, res) {
 
   try {
     // 首次初始化（fingerprint + lifecycle）
-    await ensureInitialized(apiKey, abortController.signal);
+    if (!await initializeForRoute(route, res, abortController.signal)) return;
     // 转发到 CC API（传入客户端 headers，用于提取 session ID）
     let ccResponse = await forwardToCC(ccBody, apiKey, req.headers, abortController.signal, promptCacheKey);
 
@@ -3382,7 +3408,7 @@ async function handleMessages(req, res) {
 
   try {
     // 首次初始化（fingerprint + lifecycle）
-    await ensureInitialized(apiKey, abortController.signal);
+    if (!await initializeForRoute(route, res, abortController.signal)) return;
     let ccResponse = await forwardToCC(ccBody, apiKey, req.headers, abortController.signal);
 
     if (!ccResponse.ok) {
@@ -4459,7 +4485,7 @@ async function handleResponses(req, res) {
   });
 
   try {
-    await ensureInitialized(apiKey, abortController.signal);
+    if (!await initializeForRoute(route, res, abortController.signal)) return;
     let ccResponse = await forwardToCC(ccBody, apiKey, req.headers, abortController.signal, promptCacheKey);
 
     if (!ccResponse.ok) {
@@ -4819,8 +4845,12 @@ let ADMIN_DISABLED_WARNED = false;
 
 function adminEnabled() { return !!CFG.adminToken; }
 
+const ADMIN_AUTH_FAILURE_MAX = 1024;
+const ADMIN_AUTH_FAILURE_THRESHOLD = 5;
+const adminAuthFailures = new Map();
+
 function checkAdminAuth(req) {
-  if (!adminEnabled()) return false;
+  if (!adminEnabled()) return { ok: false, retryAfter: 0 };
   const h = req.headers || {};
   let token = h['x-admin-token'] || h['X-Admin-Token'] || '';
   if (!token) {
@@ -4830,8 +4860,25 @@ function checkAdminAuth(req) {
       if (m) token = m[1].trim();
     }
   }
-  if (typeof token !== 'string' || !token) return false;
-  return timingSafeEqualStr(CFG.adminToken, token);
+  const ip = req.socket?.remoteAddress || 'unknown';
+  if (typeof token === 'string' && token && timingSafeEqualStr(CFG.adminToken, token)) {
+    adminAuthFailures.delete(ip);
+    return { ok: true, retryAfter: 0 };
+  }
+  const now = Date.now();
+  const state = adminAuthFailures.get(ip) || { failures: 0, blockedUntil: 0, backoffMs: 0 };
+  state.failures++;
+  let retryAfter = Math.max(0, Math.ceil((state.blockedUntil - now) / 1000));
+  if (!retryAfter && state.failures >= ADMIN_AUTH_FAILURE_THRESHOLD) {
+    state.backoffMs = Math.min(state.backoffMs ? state.backoffMs * 2 : 60000, 900000);
+    state.blockedUntil = now + state.backoffMs;
+    if (state.failures > ADMIN_AUTH_FAILURE_THRESHOLD) retryAfter = Math.ceil(state.backoffMs / 1000);
+    log('warn', 'Admin authentication failures', { ip, failures: state.failures });
+  }
+  adminAuthFailures.delete(ip);
+  if (adminAuthFailures.size >= ADMIN_AUTH_FAILURE_MAX) adminAuthFailures.delete(adminAuthFailures.keys().next().value);
+  adminAuthFailures.set(ip, state);
+  return { ok: false, retryAfter };
 }
 
 function adminJSON(res, status, data) {
@@ -4986,6 +5033,7 @@ async function fetchAccountUsage(account) {
     ? Math.max(plan.monthlyCredits, monthlyRemaining)
     : totalSpent + totalRemaining;
   const totalPool = poolBase + purchasedRemaining + freeRemaining;
+  const hasCreditsInfo = totalRemaining > 0 || totalSpent > 0;
   return {
     ok: true,
     fetchedAt: new Date(now).toISOString(),
@@ -4996,8 +5044,8 @@ async function fetchAccountUsage(account) {
     credits: {
       monthlyRemaining, purchasedRemaining, freeRemaining,
       totalRemaining, totalSpent, totalPool,
-      usagePercent: totalPool > 0 ? Math.min(1, Math.max(0, (totalPool - totalRemaining) / totalPool)) : 0,
-      hasCreditsInfo: totalRemaining > 0 || totalSpent > 0,
+      usagePercent: totalPool > 0 ? Math.min(1, Math.max(0, (totalPool - totalRemaining) / totalPool)) : null,
+      hasCreditsInfo,
       windowLimits: top.windowLimits ?? creds.windowLimits ?? null,
       sandboxMinutes: top.sandboxMinutes ?? creds.sandboxMinutes ?? null,
       sandboxAccess: (top.sandboxAccess ?? creds.sandboxAccess) === true,
@@ -6033,8 +6081,14 @@ async function handleAdmin(req, res, url) {
     return;
   }
 
-  if (!checkAdminAuth(req)) {
-    adminJSON(res, 401, { error: { message: 'Unauthorized', type: 'unauthorized' } });
+  const auth = checkAdminAuth(req);
+  if (!auth.ok) {
+    if (auth.retryAfter > 0) {
+      res.setHeader('Retry-After', String(auth.retryAfter));
+      adminJSON(res, 429, { error: { message: 'Too many authentication failures', type: 'rate_limit_error' } });
+    } else {
+      adminJSON(res, 401, { error: { message: 'Unauthorized', type: 'unauthorized' } });
+    }
     return;
   }
 
@@ -6469,6 +6523,9 @@ server.keepAliveTimeout = KEEPALIVE_TIMEOUT_MS;
 server.headersTimeout = KEEPALIVE_TIMEOUT_MS + 1000;   // Node 要求 headersTimeout > keepAliveTimeout
 
 server.listen(CFG.port, CFG.host, () => {
+  if (CFG.adminToken.length < 32) {
+    log('warn', 'SECURITY WARNING: weak admin token; use a long random token (at least 32 characters)', { length: CFG.adminToken.length });
+  }
   const usageStartupTimer = setTimeout(() => {
     nextUsageRefreshAt = Date.now() + USAGE_REFRESH_MS;
     refreshUsageInBackground();
