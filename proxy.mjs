@@ -374,7 +374,7 @@ function updateWindowBlock(r, limits, now) {
   const kind = exceeded.reduce((later, candidate) => (resetAtOf(candidate) || 0) > (resetAtOf(later) || 0) ? candidate : later);
   const resetAt = resetAtOf(kind);
   const until = Math.min(resetAt > now ? resetAt : now + STORE.routing.windowFallbackCooldownMs, now + 3600000);
-  r.windowBlockedUntil = r.windowExhausted ? Math.min(r.windowBlockedUntil, until) : until;
+  r.windowBlockedUntil = r.windowExhausted ? Math.max(r.windowBlockedUntil, until) : until;
   r.windowExhausted = true;
   r.windowKind = kind;
   r.windowResetAt = resetAt;
@@ -598,7 +598,7 @@ function releaseAccount(accountId, outcome, latencyMs) {
  *
  * forward: async (apiKey) => Response  —— 负责 ensureInitialized + forwardToCC 的重放闭包。
  */
-async function creditFailover({ route, apiKey, ccResponse, errorText, mapped, outcome, req, forward }) {
+async function creditFailover({ route, apiKey, ccResponse, errorText, mapped, outcome, req, forward, abortController }) {
   const routing = STORE.routing;
   const cur = { route, apiKey, ccResponse, errorText, mapped, creditExhausted: false, windowExhausted: false };
   const tried = new Set(route && route.accountId ? [route.accountId] : []);
@@ -654,7 +654,11 @@ async function creditFailover({ route, apiKey, ccResponse, errorText, mapped, ou
     try {
       cur.ccResponse = await forward(next.upstreamKey);
     } catch (e) {
-      next.release({ state: 'fail', status: 502, message: 'Upstream forwarding failed' }, null);
+      if (e.name === 'AbortError' || abortController?.signal?.aborted) {
+        next.release({ state: 'aborted' }, null);
+      } else {
+        next.release({ state: 'fail', status: 502, message: 'Upstream forwarding failed' }, null);
+      }
       throw e;
     }
     cur.errorText = cur.ccResponse.ok ? '' : await cur.ccResponse.text().catch(() => '');
@@ -975,13 +979,13 @@ const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 // 进程内全局兜底，不替代下游方案，也不感知客户端身份。
 // 内存 = 在途数 × (0.13MB + 5.5 × body_MB)：body 上限只管住单请求量级，乘数由本项封顶。
 // 超限返回 503 + Retry-After（SDK 会自行退避重试），而不是放任进程被 OOM 杀掉。
-// 默认 0 = 关闭，不限制并发（既有的反代层定位不变，行为零变化）；需要时按需开启：
+// 默认 32；显式设 0 可关闭并发限制：
 //   CC_MAX_INFLIGHT=32 npm start
 // 注意：body 上限只管住单请求量级，乘数由本项封顶。默认 body 上限 100MB 时，
 // N × 最坏 550MB —— 要硬性内存上界需同时下调 CC_MAX_BODY_MB。
 const MAX_INFLIGHT = (() => {
   const n = Number.parseInt(process.env.CC_MAX_INFLIGHT ?? '', 10);
-  return Number.isFinite(n) && n > 0 ? n : 0;            // 默认 0 = 不限
+  return Number.isFinite(n) && n >= 0 ? n : 32;
 })();
 
 let inflightCount = 0;   // 当前在途请求数（不含 /health）
@@ -1072,32 +1076,58 @@ function isWireUuid(v) {
 // 只是下次多算一次 HMAC。淘汰按「空闲」而非「session 过期」判定，
 // 这样活跃 key 的 nextInitAt 不会被重置（否则会重复发送指纹/lifecycle 预请求）。
 const KEY_STATE_IDLE_MS = 24 * 60 * 60 * 1000; // 24h 未活动即淘汰
+const KEY_STATE_MAX = Math.trunc(clampNum(process.env.CC_KEY_STATE_MAX, 512, 16, 100000));
+const KEY_INIT_PER_MIN = Math.trunc(clampNum(process.env.CC_KEY_INIT_PER_MIN, 60, 0, Number.MAX_SAFE_INTEGER));
 const keyStateStore = new Map(); // apiKey → { fingerprint, nextInitAt, lastSeen }
+const poolKeyStateStore = new Map();
+const keyInitTimes = [];
 
-function getOrCreateKeyState(apiKey) {
-  let state = keyStateStore.get(apiKey);
+function getOrCreateKeyState(apiKey, pooled = false) {
+  const store = pooled ? poolKeyStateStore : keyStateStore;
+  let state = store.get(apiKey);
   if (!state) {
+    if (!pooled && store.size >= KEY_STATE_MAX) store.delete(store.keys().next().value);
     state = {
       fingerprint: generateFingerprint(apiKey),
       nextInitAt: 0,
       lastSeen: 0,
     };
-    keyStateStore.set(apiKey, state);
     log('info', 'Fingerprint derived for key', {
-      keyPrefix: apiKey.slice(0, 8),
+      keyHash: crypto.createHash('sha256').update(apiKey).digest('hex').slice(0, 8),
       thumbmark: state.fingerprint.thumbmark.slice(0, 12),
     });
   }
+  store.delete(apiKey);
+  store.set(apiKey, state);
   state.lastSeen = Date.now();
   return state;
+}
+
+async function initializeForRoute(route, res, signal) {
+  if (route.mode === 'legacy' && !keyStateStore.has(route.upstreamKey) && KEY_INIT_PER_MIN > 0) {
+    const now = Date.now();
+    while (keyInitTimes.length && keyInitTimes[0] <= now - 60000) keyInitTimes.shift();
+    if (keyInitTimes.length >= KEY_INIT_PER_MIN) {
+      const retryAfter = Math.max(1, Math.ceil((keyInitTimes[0] + 60000 - now) / 1000));
+      log('warn', 'Legacy key initialization rate limit reached', { count: keyInitTimes.length });
+      res.setHeader('Retry-After', String(retryAfter));
+      sendJSON(res, 429, { error: { message: 'Too many new legacy keys', type: 'rate_limit_error' }, retry_after: retryAfter });
+      return false;
+    }
+    keyInitTimes.push(now);
+  }
+  await ensureInitialized(route.upstreamKey, signal, route.mode === 'pool');
+  return true;
 }
 
 // 空闲淘汰：纯内存卫生，不影响设备身份（见上）
 setInterval(() => {
   const now = Date.now();
   let evicted = 0;
-  for (const [key, state] of keyStateStore) {
-    if (now - state.lastSeen > KEY_STATE_IDLE_MS) { keyStateStore.delete(key); evicted++; }
+  for (const store of [keyStateStore, poolKeyStateStore]) {
+    for (const [key, state] of store) {
+      if (now - state.lastSeen > KEY_STATE_IDLE_MS) { store.delete(key); evicted++; }
+    }
   }
   if (evicted > 0) log('info', 'Key state evicted (idle)', { evicted, remaining: keyStateStore.size });
 }, 60 * 60 * 1000); // 每小时
@@ -1106,8 +1136,8 @@ setInterval(() => {
 const INIT_REFRESH_MS = 8 * 60 * 60 * 1000;    // 8h
 const INIT_JITTER_MS  = 2 * 60 * 60 * 1000;    // 2h 抖动
 
-async function ensureInitialized(apiKey, signal) {
-  const state = getOrCreateKeyState(apiKey);
+async function ensureInitialized(apiKey, signal, pooled = true) {
+  const state = getOrCreateKeyState(apiKey, pooled);
   const now = Date.now();
   if (now < state.nextInitAt) return;
 
@@ -1907,7 +1937,32 @@ function mapCcEventError(event) {
 
 // ── HTTP 请求处理 ──────────────────────────────────
 
-function readBody(req) {
+function closeUnreadRequest(req, res) {
+  res.setHeader('Connection', 'close');
+  res.once('finish', () => req.destroy());
+}
+
+function bodySizeError(req, bytes, known) {
+  const mb = Math.round(MAX_BODY_SIZE / 1024 / 1024);
+  const sizeNote = ` (body is ${(bytes / 1048576).toFixed(1)}MB${known ? '' : '+'})`;
+  log('warn', 'Request body rejected (too large)', {
+    path: req.url,
+    limitMB: mb,
+    bodyMB: +(bytes / 1048576).toFixed(1),
+    exact: known,
+  });
+  const err = new Error(`Request body exceeds ${mb}MB limit${sizeNote}`);
+  err.statusCode = 413;
+  err.bodyBytes = bytes;
+  return err;
+}
+
+function readBody(req, res) {
+  const declared = Number.parseInt(req.headers['content-length'] ?? '', 10);
+  if (declared > MAX_BODY_SIZE) {
+    closeUnreadRequest(req, res);
+    return Promise.reject(bodySizeError(req, declared, true));
+  }
   return new Promise((resolve, reject) => {
     const chunks = [];
     let totalSize = 0;
@@ -1927,24 +1982,12 @@ function readBody(req) {
       if (totalSize > MAX_BODY_SIZE) {
         settled = true;
         chunks.length = 0;
-        const mb = Math.round(MAX_BODY_SIZE / 1024 / 1024);
         // 只报上限等于让人去猜自己超了多少 —— 客户端要据此决定"拆请求"还是"去申请提额"。
         // nginx 开了 proxy_request_buffering 时会带 Content-Length，据此给出真实体积；
         // 没有该头（chunked）时退回"已收到多少"，并标注它是下界。
-        const declared = Number.parseInt(req.headers['content-length'] ?? '', 10);
         const known = Number.isFinite(declared) && declared > 0;
         const bytes = known ? declared : totalSize;
-        const sizeNote = ` (body is ${(bytes / 1048576).toFixed(1)}MB${known ? '' : '+'})`;
-        log('warn', 'Request body rejected (too large)', {
-          path: req.url,
-          limitMB: mb,
-          bodyMB: +(bytes / 1048576).toFixed(1),
-          exact: known,
-        });
-        const err = new Error(`Request body exceeds ${mb}MB limit${sizeNote}`);
-        err.statusCode = 413;
-        err.bodyBytes = bytes;
-        reject(err);
+        reject(bodySizeError(req, bytes, known));
         return;
       }
       chunks.push(c);
@@ -2217,18 +2260,6 @@ async function forwardToCC(body, apiKey, incomingHeaders = {}, signal, promptCac
 // ── 路由 ────────────────────────────────────────────
 
 async function handleChatCompletions(req, res) {
-  let openaiReq;
-  try {
-    openaiReq = await readBody(req);
-  } catch (e) {
-    if (e.statusCode === 413) {
-      sendJSON(res, 413, { error: { message: e.message, type: 'invalid_request_error' } });
-      return;
-    }
-    sendJSON(res, 400, { error: { message: 'Invalid JSON body', type: 'invalid_request_error' } });
-    return;
-  }
-
   let route = resolveRoute(req.headers);
   if (route && route.error === 'no_available_account') {
     res.setHeader('Retry-After', '5');
@@ -2236,6 +2267,7 @@ async function handleChatCompletions(req, res) {
     return;
   }
   if (!route) {
+    closeUnreadRequest(req, res);
     sendJSON(res, 401, { error: { message: 'Missing API key. Send in Authorization: Bearer <key> or x-api-key header', type: 'auth_error' } });
     return;
   }
@@ -2244,6 +2276,18 @@ async function handleChatCompletions(req, res) {
   const startTime = Date.now();
   const markTtft = () => { if (outcome.ttftMs == null) outcome.ttftMs = Date.now() - startTime; };
   try {
+
+  let openaiReq;
+  try {
+    openaiReq = await readBody(req, res);
+  } catch (e) {
+    if (e.statusCode === 413) {
+      sendJSON(res, 413, { error: { message: e.message, type: 'invalid_request_error' } });
+      return;
+    }
+    sendJSON(res, 400, { error: { message: 'Invalid JSON body', type: 'invalid_request_error' } });
+    return;
+  }
 
   const stream = openaiReq.stream === true;
   const model = openaiReq.model || 'deepseek/deepseek-v4-flash';
@@ -2346,7 +2390,7 @@ async function handleChatCompletions(req, res) {
 
   try {
     // 首次初始化（fingerprint + lifecycle）
-    await ensureInitialized(apiKey, abortController.signal);
+    if (!await initializeForRoute(route, res, abortController.signal)) return;
     // 转发到 CC API（传入客户端 headers，用于提取 session ID）
     let ccResponse = await forwardToCC(ccBody, apiKey, req.headers, abortController.signal, promptCacheKey);
 
@@ -2355,7 +2399,7 @@ async function handleChatCompletions(req, res) {
       let mapped = mapCcError(ccResponse.status, errorText);
       // 额度耗尽 → 换号重放（客户端无感）；其余错误照旧返回
       const fo = await creditFailover({
-        route, apiKey, ccResponse, errorText, mapped, outcome, req,
+        route, apiKey, ccResponse, errorText, mapped, outcome, req, abortController,
         forward: async (key) => {
           await ensureInitialized(key, abortController.signal);
           return forwardToCC(ccBody, key, req.headers, abortController.signal, promptCacheKey);
@@ -3319,9 +3363,58 @@ function sendAnthropicError(res, status, type, message, retryAfter) {
 }
 
 async function handleMessages(req, res) {
+  let route = resolveRoute(req.headers);
+  if (route && route.error === 'no_available_account') {
+    res.setHeader('Retry-After', '5');
+    sendJSON(res, 503, { type: 'error', error: { type: 'no_available_account', message: 'No available upstream account for this token' }, retry_after: 5 });
+    return;
+  }
+  if (!route) {
+    closeUnreadRequest(req, res);
+    sendJSON(res, 401, { type: 'error', error: { type: 'authentication_error', message: 'Missing API key. Send in Authorization: Bearer <key> or x-api-key header' } });
+    return;
+  }
+  let apiKey = route.upstreamKey;
+  const outcome = { state: 'pending', ttftMs: null, status: null, code: null, message: null };
+
+  const startTime = Date.now();
+  const abortController = new AbortController();
+  let aborted = false;
+  let stream = false;
+  let model = 'claude-sonnet-4-6';
+  const markTtft = () => { if (outcome.ttftMs == null) outcome.ttftMs = Date.now() - startTime; };
+  let messageId = '';
+  let reader = null;
+  let bytesReceived = 0; let lastCcEvent = ''; let fullText = '';
+
+  res.on('close', () => {
+    if (res.writableEnded) return;
+    aborted = true;
+    if (outcome.state === 'pending') outcome.state = 'aborted';
+    if (!abortController.signal.aborted) {
+      try {
+        res.write(`event: message_delta\ndata: ${JSON.stringify({
+          type: 'message_delta',
+          delta: { stop_reason: 'end_turn' },
+          usage: { output_tokens: 0, input_tokens: 0, cache_read_input_tokens: 0 },
+        })}\n\n`);
+        res.write(`event: message_stop\ndata: ${JSON.stringify({ type: 'message_stop' })}\n\n`);
+      } catch {}
+      try { abortController.abort(); } catch {}
+    }
+    log('warn', 'Client disconnected', {
+      path: '/v1/messages',
+      model,
+      messageId,
+      streaming: stream,
+      elapsedMs: Date.now() - startTime,
+    });
+  });
+
+  try {
   let anthropicReq;
   try {
-    anthropicReq = await readBody(req);
+    anthropicReq = await readBody(req, res);
   } catch (e) {
     if (e.statusCode === 413) {
       sendAnthropicError(res, 413, 'invalid_request_error', e.message);
@@ -3331,21 +3424,8 @@ async function handleMessages(req, res) {
     return;
   }
 
-  let route = resolveRoute(req.headers);
-  if (route && route.error === 'no_available_account') {
-    res.setHeader('Retry-After', '5');
-    sendJSON(res, 503, { type: 'error', error: { type: 'no_available_account', message: 'No available upstream account for this token' }, retry_after: 5 });
-    return;
-  }
-  if (!route) {
-    sendJSON(res, 401, { type: 'error', error: { type: 'authentication_error', message: 'Missing API key. Send in Authorization: Bearer <key> or x-api-key header' } });
-    return;
-  }
-  let apiKey = route.upstreamKey;
-  const outcome = { state: 'pending', ttftMs: null, status: null, code: null, message: null };
-
-  const stream = anthropicReq.stream === true;
-  const model = anthropicReq.model || 'claude-sonnet-4-6';
+  stream = anthropicReq.stream === true;
+  model = anthropicReq.model || 'claude-sonnet-4-6';
 
   // Convert Anthropic → OpenAI → CC
   let openaiReq = convertAnthropicToOpenAI(anthropicReq);
@@ -3355,25 +3435,16 @@ async function handleMessages(req, res) {
   openaiReq = null;
   anthropicReq = null;
 
-  const abortController = new AbortController();
-  let aborted = false;
-  // 提前初始化，断连回调/超时 catch 安全引用（避免块级作用域 ReferenceError）
-  const startTime = Date.now();
-  const markTtft = () => { if (outcome.ttftMs == null) outcome.ttftMs = Date.now() - startTime; };
-  let messageId = '';
-  let reader = null;
-  let bytesReceived = 0; let lastCcEvent = ''; let fullText = '';
-
   try {
     // 首次初始化（fingerprint + lifecycle）
-    await ensureInitialized(apiKey, abortController.signal);
+    if (!await initializeForRoute(route, res, abortController.signal)) return;
     let ccResponse = await forwardToCC(ccBody, apiKey, req.headers, abortController.signal);
 
     if (!ccResponse.ok) {
       let errorText = await ccResponse.text().catch(() => '');
       let mapped = mapCcError(ccResponse.status, errorText);
       const fo = await creditFailover({
-        route, apiKey, ccResponse, errorText, mapped, outcome, req,
+        route, apiKey, ccResponse, errorText, mapped, outcome, req, abortController,
         forward: async (key) => {
           await ensureInitialized(key, abortController.signal);
           return forwardToCC(ccBody, key, req.headers, abortController.signal);
@@ -3393,32 +3464,6 @@ async function handleMessages(req, res) {
         return;
       }
     }
-
-    // 下游断连检测：打断 CC 上游 + 记录日志
-    res.on('close', () => {
-      if (res.writableEnded) return; // Normal completion, not a disconnect
-      aborted = true;
-      if (outcome.state === 'pending') outcome.state = 'aborted';
-      if (!abortController.signal.aborted) {
-        // 断连前抢发 usage=0 终止事件，避免下游自行估算 token
-        try {
-          res.write(`event: message_delta\ndata: ${JSON.stringify({
-            type: 'message_delta',
-            delta: { stop_reason: 'end_turn' },
-            usage: { output_tokens: 0, input_tokens: 0, cache_read_input_tokens: 0 },
-          })}\n\n`);
-          res.write(`event: message_stop\ndata: ${JSON.stringify({ type: 'message_stop' })}\n\n`);
-        } catch {}
-        try { abortController.abort(); } catch {}
-      }
-      log('warn', 'Client disconnected', {
-        path: '/v1/messages',
-        model,
-        messageId,
-        streaming: stream,
-        elapsedMs: Date.now() - startTime,
-      });
-    });
 
     if (stream) {
       // ── 流式 Anthropic SSE ──
@@ -3720,6 +3765,7 @@ async function handleMessages(req, res) {
       try { abortController.abort(); } catch {} // 打断 CC 上游
       sendAnthropicError(res, 502, 'proxy_error', `Upstream error: ${e.message}`, 10);
     }
+  }
   } finally {
     route.release(outcome, Date.now() - startTime);
   }
@@ -4365,9 +4411,26 @@ function createResponsesSseTranslator(model, responseId, created) {
 }
 
 async function handleResponses(req, res) {
+  let route = resolveRoute(req.headers);
+  if (route && route.error === 'no_available_account') {
+    res.setHeader('Retry-After', '5');
+    sendResponsesError(res, 503, 'no_available_account', 'No available upstream account for this token', 5);
+    return;
+  }
+  if (!route) {
+    closeUnreadRequest(req, res);
+    sendResponsesError(res, 401, 'authentication_error',
+      'Missing API key. Send in Authorization: Bearer <key> or x-api-key header');
+    return;
+  }
+  let apiKey = route.upstreamKey;
+  const outcome = { state: 'pending', ttftMs: null, status: null, code: null, message: null };
+
+  const startTime = Date.now();
+  try {
   let respReq;
   try {
-    respReq = await readBody(req);
+    respReq = await readBody(req, res);
   } catch (e) {
     if (e.statusCode === 413) { sendResponsesError(res, 413, 'invalid_request_error', e.message); return; }
     sendResponsesError(res, 400, 'invalid_request_error', 'Invalid JSON body');
@@ -4379,20 +4442,6 @@ async function handleResponses(req, res) {
       'previous_response_id is not supported (this proxy is stateless); send the full input each turn');
     return;
   }
-
-  let route = resolveRoute(req.headers);
-  if (route && route.error === 'no_available_account') {
-    res.setHeader('Retry-After', '5');
-    sendResponsesError(res, 503, 'no_available_account', 'No available upstream account for this token', 5);
-    return;
-  }
-  if (!route) {
-    sendResponsesError(res, 401, 'authentication_error',
-      'Missing API key. Send in Authorization: Bearer <key> or x-api-key header');
-    return;
-  }
-  let apiKey = route.upstreamKey;
-  const outcome = { state: 'pending', ttftMs: null, status: null, code: null, message: null };
 
   let chatReq = convertResponsesToChat(respReq);
   if (!chatReq.messages.length) {
@@ -4421,7 +4470,6 @@ async function handleResponses(req, res) {
 
   const abortController = new AbortController();
   let aborted = false;
-  const startTime = Date.now();
   const markTtft = () => { if (outcome.ttftMs == null) outcome.ttftMs = Date.now() - startTime; };
   let bytesReceived = 0;
   let lastCcEvent = '';
@@ -4440,14 +4488,14 @@ async function handleResponses(req, res) {
   });
 
   try {
-    await ensureInitialized(apiKey, abortController.signal);
+    if (!await initializeForRoute(route, res, abortController.signal)) return;
     let ccResponse = await forwardToCC(ccBody, apiKey, req.headers, abortController.signal, promptCacheKey);
 
     if (!ccResponse.ok) {
       let errorText = await ccResponse.text().catch(() => '');
       let mapped = mapCcError(ccResponse.status, errorText);
       const fo = await creditFailover({
-        route, apiKey, ccResponse, errorText, mapped, outcome, req,
+        route, apiKey, ccResponse, errorText, mapped, outcome, req, abortController,
         forward: async (key) => {
           await ensureInitialized(key, abortController.signal);
           return forwardToCC(ccBody, key, req.headers, abortController.signal, promptCacheKey);
@@ -4746,6 +4794,7 @@ async function handleResponses(req, res) {
       try { res.write(translator ? translator.errorEvent(e.message) : ''); } catch (e2) {}
       try { res.end(); } catch (e2) {}
     }
+  }
   } finally {
     route.release(outcome, Date.now() - startTime);
   }
@@ -4799,8 +4848,12 @@ let ADMIN_DISABLED_WARNED = false;
 
 function adminEnabled() { return !!CFG.adminToken; }
 
+const ADMIN_AUTH_FAILURE_MAX = 1024;
+const ADMIN_AUTH_FAILURE_THRESHOLD = 5;
+const adminAuthFailures = new Map();
+
 function checkAdminAuth(req) {
-  if (!adminEnabled()) return false;
+  if (!adminEnabled()) return { ok: false, retryAfter: 0 };
   const h = req.headers || {};
   let token = h['x-admin-token'] || h['X-Admin-Token'] || '';
   if (!token) {
@@ -4810,8 +4863,25 @@ function checkAdminAuth(req) {
       if (m) token = m[1].trim();
     }
   }
-  if (typeof token !== 'string' || !token) return false;
-  return timingSafeEqualStr(CFG.adminToken, token);
+  const ip = req.socket?.remoteAddress || 'unknown';
+  if (typeof token === 'string' && token && timingSafeEqualStr(CFG.adminToken, token)) {
+    adminAuthFailures.delete(ip);
+    return { ok: true, retryAfter: 0 };
+  }
+  const now = Date.now();
+  const state = adminAuthFailures.get(ip) || { failures: 0, blockedUntil: 0, backoffMs: 0 };
+  state.failures++;
+  let retryAfter = Math.max(0, Math.ceil((state.blockedUntil - now) / 1000));
+  if (!retryAfter && state.failures >= ADMIN_AUTH_FAILURE_THRESHOLD) {
+    state.backoffMs = Math.min(state.backoffMs ? state.backoffMs * 2 : 60000, 900000);
+    state.blockedUntil = now + state.backoffMs;
+    if (state.failures > ADMIN_AUTH_FAILURE_THRESHOLD) retryAfter = Math.ceil(state.backoffMs / 1000);
+    log('warn', 'Admin authentication failures', { ip, failures: state.failures });
+  }
+  adminAuthFailures.delete(ip);
+  if (adminAuthFailures.size >= ADMIN_AUTH_FAILURE_MAX) adminAuthFailures.delete(adminAuthFailures.keys().next().value);
+  adminAuthFailures.set(ip, state);
+  return { ok: false, retryAfter };
 }
 
 function adminJSON(res, status, data) {
@@ -4966,6 +5036,7 @@ async function fetchAccountUsage(account) {
     ? Math.max(plan.monthlyCredits, monthlyRemaining)
     : totalSpent + totalRemaining;
   const totalPool = poolBase + purchasedRemaining + freeRemaining;
+  const hasCreditsInfo = totalRemaining > 0 || totalSpent > 0;
   return {
     ok: true,
     fetchedAt: new Date(now).toISOString(),
@@ -4976,8 +5047,8 @@ async function fetchAccountUsage(account) {
     credits: {
       monthlyRemaining, purchasedRemaining, freeRemaining,
       totalRemaining, totalSpent, totalPool,
-      usagePercent: totalPool > 0 ? Math.min(1, Math.max(0, (totalPool - totalRemaining) / totalPool)) : 0,
-      hasCreditsInfo: totalRemaining > 0 || totalSpent > 0,
+      usagePercent: totalPool > 0 ? Math.min(1, Math.max(0, (totalPool - totalRemaining) / totalPool)) : null,
+      hasCreditsInfo,
       windowLimits: top.windowLimits ?? creds.windowLimits ?? null,
       sandboxMinutes: top.sandboxMinutes ?? creds.sandboxMinutes ?? null,
       sandboxAccess: (top.sandboxAccess ?? creds.sandboxAccess) === true,
@@ -5217,6 +5288,7 @@ td{font-variant-numeric:tabular-nums}
   header#bar .brand{grid-area:brand;min-width:0}
   header#bar .stats{grid-area:stats;min-width:0;max-width:100%;flex-wrap:nowrap;overflow-x:auto;scrollbar-width:none}
   header#bar .stats::-webkit-scrollbar{display:none}
+  header#bar .stats.has-more{mask-image:linear-gradient(90deg,#000 calc(100% - 24px),transparent);-webkit-mask-image:linear-gradient(90deg,#000 calc(100% - 24px),transparent)}
   header#bar .stat{flex:0 0 auto}
   header#bar .spacer{display:none}
   header#bar .theme-toggle{grid-area:theme;min-width:40px;min-height:40px}
@@ -5422,6 +5494,11 @@ function logout(){token='';try{sessionStorage.removeItem(TKEY);}catch(e){}showAu
 function render(){renderStats();renderTabs();renderView();}
 
 function stat(k,v){var s=el('span','stat');append(s,el('span','sk',k),el('b',null,String(v)));return s;}
+function updateStatsOverflow(){
+  var w=byId('stats');
+  if(w.scrollWidth>w.clientWidth&&(w.scrollLeft||0)+w.clientWidth<w.scrollWidth-1)w.classList.add('has-more');
+  else w.classList.remove('has-more');
+}
 function renderStats(){
   var w=byId('stats');clear(w);
   var m=S.metrics||{};var t=m.totals||{};
@@ -5434,6 +5511,7 @@ function renderStats(){
   var p=el('span','stat',m.persistence===false?'仅内存（持久化失败）':'持久化正常');
   if(m.persistence===false)p.className='stat bad';
   append(w,p);
+  updateStatsOverflow();
 }
 function renderTabs(){
   var tabs=byId('tabs').children;
@@ -5955,6 +6033,8 @@ function initTheme(){
 function boot(){
   initTheme();
   byId('logout').onclick=logout;
+  byId('stats').addEventListener('scroll',updateStatsOverflow);
+  if(typeof window!=='undefined')window.addEventListener('resize',updateStatsOverflow);
   var tabs=byId('tabs').children;
   for(var i=0;i<tabs.length;i++){
     (function(b){b.onclick=function(){S.tab=b.getAttribute('data-tab');renderTabs();renderView();resumePolling();};})(tabs[i]);
@@ -6013,8 +6093,14 @@ async function handleAdmin(req, res, url) {
     return;
   }
 
-  if (!checkAdminAuth(req)) {
-    adminJSON(res, 401, { error: { message: 'Unauthorized', type: 'unauthorized' } });
+  const auth = checkAdminAuth(req);
+  if (!auth.ok) {
+    if (auth.retryAfter > 0) {
+      res.setHeader('Retry-After', String(auth.retryAfter));
+      adminJSON(res, 429, { error: { message: 'Too many authentication failures', type: 'rate_limit_error' } });
+    } else {
+      adminJSON(res, 401, { error: { message: 'Unauthorized', type: 'unauthorized' } });
+    }
     return;
   }
 
@@ -6348,7 +6434,13 @@ async function handleAdmin(req, res, url) {
 
 const server = http.createServer(async (req, res) => {
   const host = req.headers.host || 'localhost';
-  const url = new URL(req.url, `http://${host}`);
+  const url = new URL(req.url, 'http://localhost');
+  const authority = host.match(/^(?:\[[0-9a-fA-F:.]+\]|[^\s/?#:@[\]\\]+)(?::([0-9]+))?$/);
+  if (!authority || (authority[1] !== undefined && Number(authority[1]) > 65535)) {
+    closeUnreadRequest(req, res);
+    sendJSON(res, 400, { error: { message: 'Invalid Host header', type: 'invalid_request_error' } });
+    return;
+  }
   const isAdminPath = url.pathname === '/admin' || url.pathname.startsWith('/admin/');
 
   // CORS：仅数据面发 ACAO:*。管理面同源自定义头不触发预检，避免引入 CSRF 面。
@@ -6406,7 +6498,9 @@ const server = http.createServer(async (req, res) => {
       sendJSON(res, 404, { error: { message: 'Not found', type: 'not_found' } });
     }
   } catch (e) {
-    sendJSON(res, 500, { error: { message: e.message, type: 'internal_error' } });
+    const requestId = randomUUID();
+    log('error', 'Data API error', { requestId, method: req.method, path: url.pathname, message: e.message });
+    sendJSON(res, 500, { error: { message: 'Internal error', type: 'internal_error' }, request_id: requestId });
   }
 });
 
@@ -6443,6 +6537,9 @@ server.keepAliveTimeout = KEEPALIVE_TIMEOUT_MS;
 server.headersTimeout = KEEPALIVE_TIMEOUT_MS + 1000;   // Node 要求 headersTimeout > keepAliveTimeout
 
 server.listen(CFG.port, CFG.host, () => {
+  if (CFG.adminToken.length < 32) {
+    log('warn', 'SECURITY WARNING: weak admin token; use a long random token (at least 32 characters)', { length: CFG.adminToken.length });
+  }
   const usageStartupTimer = setTimeout(() => {
     nextUsageRefreshAt = Date.now() + USAGE_REFRESH_MS;
     refreshUsageInBackground();
@@ -6476,6 +6573,9 @@ server.listen(CFG.port, CFG.host, () => {
   });
   if (CLIENT_DRAIN_TIMEOUT_MS > 0) {
     log('info', 'Client drain timeout enabled', { timeoutMs: CLIENT_DRAIN_TIMEOUT_MS });
+  }
+  if (MAX_INFLIGHT === 0) {
+    log('warn', 'CC_MAX_INFLIGHT=0 disables the concurrency limit: unlimited requests pose a memory exhaustion risk');
   }
   // 内存提示：body 上限隐含的最坏内存 = 上限 × 实测放大系数（见 MAX_BODY_SIZE 注释 / issue #20）
   const bodyCapMB = Math.round(MAX_BODY_SIZE / 1048576);
