@@ -5478,12 +5478,12 @@ function selectField(labelText,opts,value){
   opts.forEach(function(o){var op=el('option',null,o[1]);op.value=o[0];if(o[0]===value)op.selected=true;s.appendChild(op);});
   append(l,s);return {el:l,inp:s};
 }
-function confirmDelete(msg,onYes){
+function confirmDelete(msg,onYes,confirmLabel){
   var ov=el('div','overlay');var box=el('div','modal');
   append(box,el('h2',null,'请确认'),el('p',null,msg));
   var act=el('div','actions');
   act.appendChild(mkbtn('取消',null,function(){document.body.removeChild(ov);}));
-  act.appendChild(mkbtn('确认删除','danger',function(){document.body.removeChild(ov);onYes();}));
+  act.appendChild(mkbtn(confirmLabel||'确认删除','danger',function(){document.body.removeChild(ov);onYes();}));
   append(box,act);append(ov,box);document.body.appendChild(ov);
 }
 
@@ -5519,6 +5519,10 @@ function accountCard(a,m){
   addRow(rows,'评分',(m&&m.score!==undefined)?m.score.toFixed(3):'—');
   addRow(rows,'冷却',(m&&m.cooling)?(m.creditResetUnknown?'套餐重置时间未知':('剩余 '+fmtDur(m.cooldownUntil-Date.now()))):'否');
   if(m&&m.creditExhausted)addRow(rows,'额度',m.creditResetAt?'耗尽（到套餐重置时间恢复：'+new Date(m.creditResetAt).toLocaleString()+'）':'耗尽（套餐重置时间未知，保持停用）');
+  if(m&&m.windowExhausted){
+    var windowName={fiveHour:'5 小时',weekly:'每周'}[m.windowKind]||m.windowKind||'未知';
+    addRow(rows,'窗口','窗口暂停（'+windowName+'，'+(m.windowResetAt?'到 '+new Date(m.windowResetAt).toLocaleString()+' 解除':'等待重置')+'）');
+  }
   c.appendChild(rows);
   if(m&&m.lastError){append(c,el('div','key','最后错误: '+(m.lastError.status||'')+' '+(m.lastError.code||m.lastError.message||'')));}
   var sw=el('label','switch');var cb=el('input');cb.type='checkbox';cb.checked=!!a.enabled;
@@ -5528,6 +5532,11 @@ function accountCard(a,m){
   append(act,mkbtn('编辑',null,function(){openAccountModal(a);}));
   append(act,mkbtn('测试',null,function(){testAccount(a,act);}));
   append(act,mkbtn('重置指标',null,function(){post('/admin/api/accounts/'+a.id+'/reset-metrics').then(function(){toast('指标已重置','ok');refresh();}).catch(function(e){toast('重置失败：'+(e&&e.message?e.message:String(e)),'err');});}));
+  if(m&&(m.creditExhausted||m.windowExhausted||m.cooling))append(act,mkbtn('解除阻断','danger',function(){
+    confirmDelete('解除「'+a.name+'」的额度/窗口阻断？解除后它会立即回到选路池；若上游仍然拒绝（账号确实耗尽），下一次请求会重新进入冷却。',function(){
+      post('/admin/api/accounts/'+a.id+'/clear-blocks').then(function(){toast('阻断已解除','ok');refresh();}).catch(function(e){toast('解除失败：'+e.message,'err');});
+    },'解除阻断');
+  }));
   append(act,mkbtn('删除','danger',function(){confirmDelete('删除账号「'+a.name+'」？此操作不可撤销。',function(){del('/admin/api/accounts/'+a.id).then(function(){toast('已删除','ok');refresh();});});}));
   c.appendChild(act);
   return c;
@@ -6097,6 +6106,31 @@ async function handleAdmin(req, res, url) {
         const view = await getAccountUsage(STORE.accounts[idx], url.searchParams.get('refresh') === '1');
         return adminJSON(res, 200, { usage: view });
       }
+
+      if (segs.length === 3 && segs[2] === 'clear-blocks' && method === 'POST') {
+        const account = STORE.accounts[idx];
+        const metrics = getRuntime(id);
+        const cleared = {
+          creditExhausted: metrics.creditExhausted,
+          creditResetAt: metrics.creditResetAt,
+          windowExhausted: metrics.windowExhausted,
+          windowKind: metrics.windowKind,
+          cooldownUntil: metrics.cooldownUntil,
+        };
+        metrics.creditExhausted = false;
+        metrics.creditResetAt = null;
+        metrics.windowExhausted = false;
+        metrics.windowResetAt = null;
+        metrics.windowKind = null;
+        metrics.windowBlockedUntil = 0;
+        metrics.cooldownUntil = 0;
+        metrics.cooldownLevel = 0;
+        metrics.consecutiveFailures = 0;
+        log('info', 'Admin: account blocks cleared', { accountId: id, name: account.name, cleared });
+        return adminJSON(res, 200, { ok: true, id, cleared });
+      }
+
+
       return fail(404, 'Not found', 'not_found');
     }
 
