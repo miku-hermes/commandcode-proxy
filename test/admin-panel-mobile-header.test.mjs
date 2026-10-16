@@ -88,7 +88,7 @@ test('移动 tab 栏：单行滚动，文字不压缩，不重写选中态', () 
   assert.equal(mobileRules.some(rule => rule.selectors.includes('.tab.active')), false);
 });
 
-test('窄屏隔离：新增布局仅在 640px 媒体查询内，桌面与主题 CSS 原样保留', () => {
+test('窄屏隔离：新增布局仅在 640px 媒体查询内，桌面布局与新增规则生效', async () => {
   for (const signature of [
     'grid-template-areas:"lights brand theme logout" "stats stats stats stats"',
     'grid-area:stats', 'scrollbar-width:none', 'min-height:40px',
@@ -96,9 +96,91 @@ test('窄屏隔离：新增布局仅在 640px 媒体查询内，桌面与主题 
     assert.ok(mobileCss.includes(signature), 'mobile media query must contain ' + signature);
     assert.ok(!outsideMobile.includes(signature), 'must not affect desktop: ' + signature);
   }
-  const css = source.match(/<style>([\s\S]*?)<\/style>/)[1];
-  const { outsideMobile: desktopCss } = splitMobileSource(css);
-  // 哈希只覆盖桌面 CSS，后端 JS 改动不应让此断言变红。
-  const digest = createHash('sha256').update(desktopCss).digest('hex');
-  assert.equal(digest, '9c5126585a6281321aaf4289fcf4436d9ff8ae67e18a793497186386a1e90740');
+  for (const signature of ['flex-wrap:nowrap', 'overflow-x:auto', 'scrollbar-width:none', '.stats::-webkit-scrollbar{display:none}']) {
+    assert.ok(mobileCss.includes(signature), 'mobile media query must contain ' + signature);
+  }
+  for (const signature of ['flex-wrap:nowrap', 'scrollbar-width:none']) {
+    assert.ok(!outsideMobile.includes(signature), 'must not affect desktop: ' + signature);
+  }
+  const desktopCss = [...outsideMobile.matchAll(/<style\b[^>]*>([\s\S]*?)<\/style>/g)]
+    .map(match => match[1]).join('\n');
+  const desktopRules = [...desktopCss.matchAll(/([^{}]+)\{([^{}]*)\}/g)]
+    .map(match => ({ selectors: match[1].trim().split(',').map(selector => selector.trim()), body: match[2] }));
+  const savedMobileRules = mobileRules.splice(0, mobileRules.length, ...desktopRules);
+  try {
+    for (const selector of ['.stats', 'header#bar .stats', 'nav#tabs']) {
+      const desktop = declarations(selector);
+      for (const [property, value] of [['flex-wrap', 'nowrap'], ['overflow-x', 'auto'], ['scrollbar-width', 'none']]) {
+        assert.notEqual(desktop[property], value, 'must not affect desktop: ' + selector + ' ' + property);
+      }
+    }
+    assert.notEqual(declarations('nav#tabs')['flex-wrap'], 'nowrap');
+    assert.equal(declarations('.rows .k')['white-space'], 'nowrap');
+    assert.equal(declarations('.card h3')['align-items'], 'flex-start');
+    assert.equal(declarations('.account-name .table-value')['text-overflow'], 'ellipsis');
+  } finally {
+    mobileRules.splice(0, mobileRules.length, ...savedMobileRules);
+  }
+
+  const { default: vm } = await import('node:vm');
+  class PanelElement {
+    constructor(tagName) {
+      this.tagName = tagName.toUpperCase();
+      this.children = [];
+      this.textContent = '';
+      this.className = '';
+      this.listeners = new Map();
+      this.classList = {
+        contains: name => this.className.split(/\s+/).includes(name),
+        add: name => { if (!this.classList.contains(name)) this.className = (this.className + ' ' + name).trim(); },
+        remove: name => { this.className = this.className.split(/\s+/).filter(value => value !== name).join(' '); },
+      };
+    }
+    appendChild(child) { this.children.push(child); child.parentNode = this; return child; }
+    removeChild(child) { this.children.splice(this.children.indexOf(child), 1); child.parentNode = null; }
+    get firstChild() { return this.children[0]; }
+    addEventListener(name, callback) { this.listeners.set(name, callback); }
+    getAttribute(name) { return this[name]; }
+    contains(child) { return this === child || this.children.some(node => node.contains(child)); }
+  }
+  const elements = Object.fromEntries(['view', 'stats', 'tabs', 'logout', 'app', 'toasts']
+    .map(id => [id, new PanelElement('div')]));
+  const stats = elements.stats;
+  stats.className = 'stats';
+  stats.clientWidth = 1280;
+  stats.scrollWidth = 1280;
+  stats.scrollLeft = 0;
+  const requests = [];
+  let poll;
+  const context = vm.createContext({
+    INIT_WEIGHTS: {},
+    window: new PanelElement('window'),
+    document: {
+      getElementById: id => elements[id], createElement: tag => new PanelElement(tag),
+      querySelector: () => null, addEventListener() {}, body: new PanelElement('body'),
+    },
+    sessionStorage: { getItem: () => 'adm_desktop_contract' },
+    setInterval(callback) { poll = callback; }, clearInterval() {}, setTimeout() {},
+    MutationObserver: class { observe() {} },
+    fetch: async path => {
+      requests.push(path);
+      return { ok: true, status: 200, text: async () => '{}' };
+    },
+  });
+  const html = source.slice(source.indexOf('const html = `<!doctype html>'));
+  const scripts = [...html.matchAll(/<script\b[^>]*>([\s\S]*?)<\/script>/g)];
+  assert.equal(scripts.length, 1, 'execute the real panel script');
+  for (const script of scripts) vm.runInContext(script[1], context);
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(requests.length, 5, 'boot must execute the real data refresh');
+  assert.equal(stats.classList.contains('has-more'), false, 'non-overflowing desktop must not show the hint');
+  assert.ok(stats.children.filter(node => node.classList.contains('stat')).length >= 7, 'render at least seven real status capsules');
+  stats.scrollWidth = 2000;
+  poll();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(stats.classList.contains('has-more'), true, 'overflow must enable the hint after rendering');
+  stats.scrollWidth = 1280;
+  poll();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(stats.classList.contains('has-more'), false, 'removing overflow must clear the hint after rendering');
 });
