@@ -104,11 +104,14 @@ test('hygiene 10: actual dispatcher 500 hides a null-body TypeError and logs its
     const body = await response.json();
     assert.deepEqual(body.error, { message: 'Internal error', type: 'internal_error' });
     assert.match(body.request_id, /^[0-9a-f-]{36}$/);
-    assert.doesNotMatch(JSON.stringify(body), /Cannot read|properties|stream|proxy\.mjs/);
+    assert.doesNotMatch(JSON.stringify(body), /Cannot read|properties|is not an object|evaluating|null|stream|proxy\.mjs/);
     await waitFor(() => fixture.proxy.logs().includes(body.request_id), 'dispatcher must log the response request id');
     const record = fixture.proxy.logs().split('\n').find(line => line.includes(body.request_id));
     assert.match(record, /Data API error/);
-    assert.match(record, /Cannot read properties of null/);
+    // 引擎无关：V8 说 "Cannot read properties of null (reading 'stream')"，
+    // JSC(bun) 说 "null is not an object (evaluating 'anthropicReq.stream')" —— 两边的共同关键信息是 null 与 stream
+    assert.match(record, /null/);
+    assert.match(record, /stream/);
     assert.match(record, /\/v1\/messages/);
     assert.equal(fixture.mock.generateCount(), 0);
   } finally { await fixture.close(); }
