@@ -283,7 +283,7 @@ async function panelHarness(html, scrollWidth, clientWidth) {
     const before = fetchCount;
     poll();
     await new Promise(resolve => setImmediate(resolve));
-    assert.equal(fetchCount, before + 5, 'run the real polling refresh');
+    assert.equal(fetchCount, before + 1, 'polling refreshes exactly the metrics endpoint');
   } };
 }
 

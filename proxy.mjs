@@ -5223,15 +5223,20 @@ main#view .stats{margin:0 0 14px}
 .card.warn::before{background:var(--warning)}
 .card.bad::before{background:var(--danger)}
 .card.gray{opacity:.6;--rise-opacity:.6}
-.card h3{margin:0 0 8px;font-size:14.5px;font-weight:600;color:var(--text-primary);display:flex;align-items:center;gap:8px}
+.card h3{margin:0 0 8px;font-size:14.5px;font-weight:600;color:var(--text-primary);display:flex;align-items:flex-start;gap:8px}
+.card .account-title{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.card h3 .badge{flex-shrink:0}
+.account-name .table-value{max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.score-components{grid-column:1 / -1;font-size:11px}
+.bar.usage-track{background:var(--border-color);border:1px solid var(--text-tertiary)}
 .badge{font-size:10.5px;font-weight:600;letter-spacing:.02em;padding:2px 9px;border-radius:999px;border:1px solid transparent}
 .b-green{background:var(--success-light);color:var(--success-fg);border-color:var(--success)}
 .b-yellow{background:var(--warning-light);color:var(--warning-fg);border-color:var(--warning)}
 .b-red{background:var(--danger-light);color:var(--danger-fg);border-color:var(--danger)}
 .b-gray{background:var(--bg-tertiary);color:var(--text-secondary);border-color:var(--border-color)}
 .key{font-family:var(--font-mono);font-size:12px;color:var(--text-tertiary);word-break:break-all;margin:6px 0}
-.rows{display:grid;grid-template-columns:1fr auto;gap:7px 14px;margin:12px 0;font-size:12.5px}
-.rows .k{color:var(--text-secondary)}
+.rows{display:grid;grid-template-columns:max-content minmax(0,1fr);gap:7px 14px;margin:12px 0;font-size:12.5px}
+.rows .k{color:var(--text-secondary);white-space:nowrap}
 .rows .v{color:var(--text-primary);text-align:right;font-weight:500;font-variant-numeric:tabular-nums}
 .actions{display:flex;gap:8px;flex-wrap:wrap;margin-top:10px;align-items:center}
 .btn{background:var(--bg-secondary);border:1px solid var(--border-color);color:var(--text-primary);padding:6px 14px;border-radius:var(--radius-sm);cursor:pointer;font-size:13px;font-weight:500;font-family:inherit;line-height:1.35;box-shadow:0 1px 1px rgba(0,0,0,.04);transition:background .15s,border-color .15s,box-shadow .15s,transform .06s}
@@ -5383,6 +5388,10 @@ function tableWrap(tbl,plain){
         var column=0;
         Array.prototype.forEach.call(row.children,function(td){
           if(td.tagName!=='TD')return;
+          if(column===0&&(labels[0]==='账号'||labels[0]==='名称')){
+            td.className=(td.className?td.className+' ':'')+'account-name';
+            td.title=td.textContent;
+          }
           if(column<labels.length&&typeof td.setAttribute==='function'){
             td.setAttribute('data-label',labels[column]);
             if(td.firstChild){
@@ -5432,8 +5441,18 @@ function isEditing(){
 function resumePolling(){
   if(!token||document.hidden||isEditing())return;
   clearInterval(pollTimer);
-  refresh();
-  pollTimer=setInterval(function(){if(token&&!document.hidden)refresh();},2000);
+  refreshMetrics();
+  pollTimer=setInterval(function(){if(token&&!document.hidden)refreshMetrics();},2000);
+}
+function refreshMetrics(){
+  if(!token||isEditing())return;
+  return api('/admin/api/metrics').then(function(m){
+    if(isEditing())return;
+    S.metrics=m;render();
+  }).catch(function(e){
+    if(e&&e.auth){showAuth();return;}
+    toast('刷新失败：'+(e&&e.message?e.message:String(e)),'err');
+  });
 }
 function refresh(force){
   if(!force&&isEditing())return;
@@ -5452,7 +5471,7 @@ function refresh(force){
     INIT_WEIGHTS=res[2].weightsPercent||INIT_WEIGHTS;
     S.metrics=res[3]||null;
     S.config=res[4]||null;
-    render();
+    render(force);
   }).catch(function(e){
     if(e&&e.auth){showAuth();return;}
     toast('刷新失败：'+(e&&e.message?e.message:String(e)),'err');
@@ -5491,7 +5510,7 @@ function showAuth(){
 }
 function logout(){token='';try{sessionStorage.removeItem(TKEY);}catch(e){}showAuth();}
 
-function render(){renderStats();renderTabs();renderView();}
+function render(force){renderStats();renderTabs();renderView(force);}
 
 function stat(k,v){var s=el('span','stat');append(s,el('span','sk',k),el('b',null,String(v)));return s;}
 function updateStatsOverflow(){
@@ -5511,6 +5530,8 @@ function renderStats(){
   var p=el('span','stat',m.persistence===false?'仅内存（持久化失败）':'持久化正常');
   if(m.persistence===false)p.className='stat bad';
   append(w,p);
+  if(m.cliProtocol)append(w,stat('协议',m.cliProtocol));
+  if(m.startedAt)append(w,stat('启动',fmtTime(m.startedAt)));
   updateStatsOverflow();
 }
 function renderTabs(){
@@ -5520,8 +5541,8 @@ function renderTabs(){
     else tabs[i].classList.remove('active');
   }
 }
-function renderView(){
-  if(renderedTab===S.tab&&viewAnimation){viewRenderPending=true;return;}
+function renderView(force){
+  if(!force&&renderedTab===S.tab&&viewAnimation){viewRenderPending=true;return;}
   var ready=S.tab!=='usage'||S.usage!==null;
   var animate=renderedTab!==S.tab&&ready;
   var v=byId('view');clear(v);
@@ -5593,15 +5614,22 @@ function renderAccounts(root){
   S.accounts.forEach(function(a){grid.appendChild(accountCard(a,metricOf(a.id)));});
   root.appendChild(grid);
 }
+function weightLabel(a,weight){
+  var enabled=(S.metrics&&S.metrics.accounts||[]).filter(function(account){return account.enabled;});
+  var maxWeight=enabled.reduce(function(max,account){return Math.max(max,account.id===a.id?Number(weight):Number(account.weight)||1);},0)||1;
+  return '权重 '+weight+'（×流量份额） · 实际份额 '+(Number(weight)/maxWeight*100).toFixed(1)+'%';
+}
 function accountCard(a,m){
   var h=healthOf(a,m);
   var c=el('div','card '+h);
-  var hd=el('h3');append(hd,document.createTextNode(a.name),el('span','badge b-'+h,badgeText(h)));
+  var name=el('span','account-title',a.name);name.title=a.name;
+  var hd=el('h3');append(hd,name,el('span','badge b-'+h,badgeText(h)));
   c.appendChild(hd);
   append(c,el('div','key',a.apiKey));
-  var wl=el('label','field');append(wl,el('span',null,'权重 '+(a.weight!==undefined?a.weight:1)+'（×流量份额）'));
-  var rng=el('input');rng.type='range';rng.min='0.1';rng.max='10';rng.step='0.1';rng.value=String(a.weight||1);
-  rng.oninput=function(){wl.firstChild.textContent='权重 '+rng.value+'（×流量份额）';};
+  var weight=m&&m.weight!==undefined?m.weight:(a.weight!==undefined?a.weight:1);
+  var wl=el('label','field');append(wl,el('span',null,weightLabel(a,weight)));
+  var rng=el('input');rng.type='range';rng.min='0.1';rng.max='10';rng.step='0.1';rng.value=String(weight);
+  rng.oninput=function(){wl.firstChild.textContent=weightLabel(a,rng.value);};
   rng.onchange=function(){patchAccount(a.id,{weight:Number(rng.value)});};
   append(wl,rng);c.appendChild(wl);
   var rows=el('div','rows');
@@ -5612,6 +5640,10 @@ function accountCard(a,m){
   addRow(rows,'平均 TTFT',msfmt(wr?wr.avgTtftMs:0));
   addRow(rows,'在途',String(m?m.inFlight:0));
   addRow(rows,'评分',(m&&m.score!==undefined)?m.score.toFixed(3):'—');
+  if(m&&m.components){
+    var components=m.components;
+    append(rows,el('div','muted score-components','评分构成：S '+Number(components.success).toFixed(2)+' · L '+Number(components.latency).toFixed(2)+' · C '+Number(components.load).toFixed(2)+' · Q '+Number(components.quota).toFixed(2)+' · 权重因子 '+Number(components.weightFactor).toFixed(2)+' · 基分 '+Number(components.base).toFixed(2)+(m.cooling||m.windowExhausted||m.creditExhausted?' · 评分归零（受阻）':'')));
+  }
   addRow(rows,'冷却',(m&&m.cooling)?(m.creditResetUnknown?'套餐重置时间未知':('剩余 '+fmtDur(m.cooldownUntil-Date.now()))):'否');
   if(m&&m.creditExhausted)addRow(rows,'额度',m.creditResetAt?'耗尽（到套餐重置时间恢复：'+new Date(m.creditResetAt).toLocaleString()+'）':'耗尽（套餐重置时间未知，保持停用）');
   if(m&&m.windowExhausted){
@@ -5626,22 +5658,24 @@ function accountCard(a,m){
   var act=el('div','actions');
   append(act,mkbtn('编辑',null,function(){openAccountModal(a);}));
   append(act,mkbtn('测试',null,function(){testAccount(a,act);}));
-  append(act,mkbtn('重置指标',null,function(){post('/admin/api/accounts/'+a.id+'/reset-metrics').then(function(){toast('指标已重置','ok');refresh();}).catch(function(e){toast('重置失败：'+(e&&e.message?e.message:String(e)),'err');});}));
+  append(act,mkbtn('重置指标',null,function(){confirmDelete('重置「'+a.name+'」的指标？会清空该账号的成功率与延迟样本，评分会立即变化。',function(){post('/admin/api/accounts/'+a.id+'/reset-metrics').then(function(){toast('指标已重置','ok');refresh(true);}).catch(function(e){toast('重置失败：'+(e&&e.message?e.message:String(e)),'err');});},'确认重置');}));
   if(m&&(m.creditExhausted||m.windowExhausted||m.cooling))append(act,mkbtn('解除阻断','danger',function(){
     confirmDelete('解除「'+a.name+'」的额度/窗口阻断？解除后它会立即回到选路池；若上游仍然拒绝（账号确实耗尽），下一次请求会重新进入冷却。',function(){
-      post('/admin/api/accounts/'+a.id+'/clear-blocks').then(function(){toast('阻断已解除','ok');refresh();}).catch(function(e){toast('解除失败：'+e.message,'err');});
+      post('/admin/api/accounts/'+a.id+'/clear-blocks').then(function(){toast('阻断已解除','ok');refresh(true);}).catch(function(e){toast('解除失败：'+e.message,'err');});
     },'解除阻断');
   }));
-  append(act,mkbtn('删除','danger',function(){confirmDelete('删除账号「'+a.name+'」？此操作不可撤销。',function(){del('/admin/api/accounts/'+a.id).then(function(){toast('已删除','ok');refresh();});});}));
+  append(act,mkbtn('删除','danger',function(){confirmDelete('删除账号「'+a.name+'」？此操作不可撤销。',function(){del('/admin/api/accounts/'+a.id).then(function(){toast('已删除','ok');refresh(true);});});}));
   c.appendChild(act);
   return c;
 }
 function patchAccount(id,patch){
-  return api('/admin/api/accounts/'+id,{method:'PATCH',body:patch}).then(function(){return refresh();})
-    .catch(function(e){toast('更新失败：'+(e&&e.message?e.message:String(e)),'err');refresh();});
+  return api('/admin/api/accounts/'+id,{method:'PATCH',body:patch}).then(function(){return refresh(true);})
+    .catch(function(e){toast('更新失败：'+(e&&e.message?e.message:String(e)),'err');refresh(true);});
 }
 function testAccount(a,host){
+  if(host.testResult&&host.testResult.parentNode===host)host.removeChild(host.testResult);
   var line=el('div','key','测试中…');host.appendChild(line);
+  host.testResult=line;
   api('/admin/api/accounts/'+a.id+'/test',{method:'POST'}).then(function(r){
     var txt='测试'+(r.ok?'通过':'失败')+' · HTTP '+r.status+' · '+r.elapsedMs+'ms';
     if(r.modelCount!==undefined)txt+=' · '+r.modelCount+' 个模型';
@@ -5676,7 +5710,7 @@ function openAccountModal(a){
     body.enabled=cb.checked;
     if(isNew&&!body.apiKey){err.textContent='API Key 不能为空';return;}
     var p=isNew?post('/admin/api/accounts',body):api('/admin/api/accounts/'+a.id,{method:'PATCH',body:body});
-    p.then(function(){document.body.removeChild(ov);toast(isNew?'账号已创建':'账号已更新','ok');refresh();})
+    p.then(function(){document.body.removeChild(ov);toast(isNew?'账号已创建':'账号已更新','ok');refresh(true);})
      .catch(function(e){err.textContent=(e&&e.message)?e.message:'操作失败';});
   }));
   append(box,act);append(ov,box);document.body.appendChild(ov);
@@ -5701,9 +5735,9 @@ function renderClients(root){
     append(r,el('td',c.accountIds===null?null:'num',c.accountIds===null?'全部':(c.accountIds.length+' 个')));
     append(r,el('td',null,c.lastUsedAt?fmtTime(c.lastUsedAt):'—'));
     var ops=el('td');var av=el('div','actions');
-    append(av,mkbtn('轮换','tiny',function(){rotateClient(c);}));
+    append(av,mkbtn('轮换','tiny',function(){confirmDelete('轮换「'+c.name+'」？轮换后旧令牌立即失效，使用它的客户端需要更新令牌；此操作不可撤销。',function(){rotateClient(c);},'确认轮换');}));
     append(av,mkbtn('编辑','tiny',function(){openClientModal(c);}));
-    append(av,mkbtn('删除','tiny danger',function(){confirmDelete('删除令牌「'+c.name+'」？',function(){del('/admin/api/clients/'+c.id).then(function(){toast('已删除','ok');refresh();});});}));
+    append(av,mkbtn('删除','tiny danger',function(){confirmDelete('删除令牌「'+c.name+'」？',function(){del('/admin/api/clients/'+c.id).then(function(){toast('已删除','ok');refresh(true);});});}));
     append(ops,av);append(r,ops);
     append(tb,r);
   });
@@ -5712,7 +5746,7 @@ function renderClients(root){
 function rotateClient(c){
   post('/admin/api/clients/'+c.id+'/rotate').then(function(res){
     if(res.client&&res.client.token)showTokenOnce(res.client.token,'令牌已轮换（仅显示一次）');
-    refresh();
+    refresh(true);
   }).catch(function(e){toast('轮换失败：'+(e&&e.message?e.message:String(e)),'err');});
 }
 function openClientModal(c){
@@ -5748,7 +5782,7 @@ function openClientModal(c){
       document.body.removeChild(ov);
       toast(isNew?'令牌已创建':'已更新','ok');
       if(isNew&&res.client&&res.client.token)showTokenOnce(res.client.token,'新令牌（仅显示一次）');
-      refresh();
+      refresh(true);
     }).catch(function(e){err.textContent=(e&&e.message)?e.message:'操作失败';});
   }));
   append(box,act);append(ov,box);document.body.appendChild(ov);
@@ -5914,11 +5948,25 @@ function renderMetrics(root){
 
 function usageMoney(v){return (v===null||v===undefined||!isFinite(v))?'—':('$'+Number(v).toFixed(2));}
 function usageBar(percent){
-  var bar=el('div','bar');var fill=el('i');var p=percent||0;
-  fill.style.width=(Math.round(p*100)+'%');
+  var bar=el('div','bar usage-track');var fill=el('i');var p=percent;
+  fill.style.width=(Math.round(Math.max(0,Math.min(1,p))*100)+'%');
   if(p>=0.9)fill.className='bad';
   else if(p>=0.7)fill.className='warn';
   append(bar,fill);return bar;
+}
+function usageWindowCell(window){
+  var td=el('td','num');
+  if(!window||!Number.isFinite(window.cap)||window.cap<=0){td.textContent='—';return td;}
+  var ratio=Number(window.used)/window.cap;
+  var bar=usageBar(ratio);
+  bar.firstChild.className=window.exceeded===true||ratio>=1?'bad':(ratio>=0.8?'warn':'');
+  append(td,el('div',null,Number(window.used).toFixed(2)+'/'+window.cap),bar);
+  if(window.exceeded===true){
+    var badge=statusBadge('已超限','red');badge.style.marginLeft='6px';
+    append(td,badge);
+  }
+  if(window.resetAt)append(td,el('div','muted','重置于 '+fmtTime(window.resetAt)));
+  return td;
 }
 function usageHasData(items){return !items||items.length===0||items.some(function(u){return !u.pending;});}
 function usageStatusText(){
@@ -5969,7 +6017,7 @@ function loadUsage(force){
 function renderUsage(root){
   var head=el('div','section-head');
   append(head,el('h2',null,'Command Code 额度'),el('span','muted',usageStatusText()));
-  append(head,mkbtn(S.usageRefreshing?'刷新中…':'刷新','',function(){if(!S.usageRefreshing)loadUsage(true);}));
+  append(head,mkbtn(S.usageRefreshing?'刷新中…':'刷新','',function(){if(!S.usageRefreshing){refresh(true);loadUsage(true);}}));
   root.appendChild(head);
   append(root,el('p','muted','直接读取上游 /alpha/whoami 与 /alpha/billing/*，后台每 '+Math.max(1,Math.round((Number(S.usageRefreshMs)||300000)/60000))+' 分钟自动刷新；账号 key 全程不外泄。'));
   if(!S.usage||!usageHasData(S.usage)){
@@ -5979,18 +6027,18 @@ function renderUsage(root){
   }
   if(S.usage.length===0){append(root,el('p','empty-state','还没有账号。'));return;}
   var tbl=el('table');var thead=el('thead');var tr=el('tr');
-  ['账号','套餐','状态','剩余','已用','总额','用量','到期','更新时间'].forEach(function(x){append(tr,el('th',null,x));});
+  ['账号','套餐','状态','剩余','已用','总额','用量','5 小时窗口','每周窗口','到期','更新时间'].forEach(function(x){append(tr,el('th',null,x));});
   append(thead,tr);append(tbl,thead);
   var tb=el('tbody');
   S.usage.forEach(function(u){
     var r=el('tr');
     append(r,el('td',null,u.name||u.id));
     if(u.pending){
-      var pendingTd=el('td');pendingTd.colSpan=8;pendingTd.className='muted';pendingTd.textContent='查询中…';
+      var pendingTd=el('td');pendingTd.colSpan=11;pendingTd.className='muted';pendingTd.textContent='查询中…';
       append(r,pendingTd);append(tb,r);return;
     }
     if(!u.ok){
-      var td=el('td');td.colSpan=8;td.className='muted';
+      var td=el('td');td.colSpan=11;td.className='muted';
       td.textContent='读取失败：'+(u.error||'unknown');
       append(r,td);append(tb,r);return;
     }
@@ -6003,8 +6051,11 @@ function renderUsage(root){
     append(r,el('td','num',usageMoney(c.totalSpent)));
     append(r,el('td','num',usageMoney(c.totalPool)));
     var tdPct=el('td','num');
-    append(tdPct,usageBar(c.usagePercent),document.createTextNode(' '+pct(c.usagePercent)));
+    if(!c.hasCreditsInfo||c.usagePercent===null||c.usagePercent===undefined)tdPct.textContent='—';
+    else append(tdPct,usageBar(c.usagePercent),document.createTextNode(' '+pct(c.usagePercent)));
     append(r,tdPct);
+    var limits=c.windowLimits||{};
+    append(r,usageWindowCell(limits.fiveHour),usageWindowCell(limits.weekly));
     append(r,el('td','num',(typeof u.daysLeft==='number')?(u.daysLeft+' 天'):'—'));
     append(r,el('td',null,fmtTime(u.fetchedAt)));
     append(tb,r);
@@ -6037,9 +6088,9 @@ function boot(){
   if(typeof window!=='undefined')window.addEventListener('resize',updateStatsOverflow);
   var tabs=byId('tabs').children;
   for(var i=0;i<tabs.length;i++){
-    (function(b){b.onclick=function(){S.tab=b.getAttribute('data-tab');renderTabs();renderView();resumePolling();};})(tabs[i]);
+    (function(b){b.onclick=function(){S.tab=b.getAttribute('data-tab');renderTabs();renderView();refresh();if(S.tab==='usage')loadUsage(false);resumePolling();};})(tabs[i]);
   }
-  pollTimer=setInterval(function(){if(token&&!document.hidden)refresh();},2000);
+  pollTimer=setInterval(function(){if(token&&!document.hidden)refreshMetrics();},2000);
   byId('view').addEventListener('focusout',function(){setTimeout(resumePolling,0);});
   new MutationObserver(function(records){
     var closed=records.some(function(record){
