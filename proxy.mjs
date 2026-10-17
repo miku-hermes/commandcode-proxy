@@ -6447,6 +6447,7 @@ async function handleAdmin(req, res, url) {
       return adminJSON(res, 200, {
         uptimeMs: Date.now() - SERVER_STARTED_AT,
         startedAt: new Date(SERVER_STARTED_AT).toISOString(),
+        cliProtocol: CC_PROTOCOL_VERSION,
         inflight: inflightCount,
         maxInflight: MAX_INFLIGHT,
         upstreamRetryStats: { ...upstreamRetryStats },
@@ -6636,10 +6637,15 @@ server.listen(CFG.port, CFG.host, () => {
   const bodyCapMB = Math.round(MAX_BODY_SIZE / 1048576);
   const worstCaseMB = Math.round(bodyCapMB * 5.5);
   if (worstCaseMB >= 500) {
-    log('warn', 'Request body limit implies high per-request worst-case memory', {
+    const configuredMaxInflight = Number(process.env.CC_MAX_INFLIGHT ?? NaN);
+    const hasExplicitMaxInflight = !!process.env.CC_MAX_INFLIGHT?.trim()
+      && Number.isSafeInteger(configuredMaxInflight) && configuredMaxInflight >= 0
+      && configuredMaxInflight === MAX_INFLIGHT;
+    log(hasExplicitMaxInflight ? 'info' : 'warn', 'Request body limit implies high per-request worst-case memory', {
       maxBodyMB: bodyCapMB,
       worstCaseRSSPerRequestMB: worstCaseMB,
-      hint: 'lower CC_MAX_BODY_MB, set CC_MAX_INFLIGHT, and/or cap in-flight requests at the reverse proxy (see README)',
+      maxInflight: MAX_INFLIGHT,
+      hint: '不要为了消除此告警而下调 CC_MAX_BODY_MB（会拒掉合法的多模态长会话，见 issue #7）；应设置 CC_MAX_INFLIGHT 限制进程内并发，并在边缘反向代理上使用 limit_conn（见 README）',
     });
   }
   if (!CFG.apiKey) {
