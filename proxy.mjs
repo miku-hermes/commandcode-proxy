@@ -1901,6 +1901,10 @@ function mapCcError(ccStatus, ccBody) {
     };
   }
 
+  if (ccStatus === 403 && /MODEL_NOT_IN_PLAN|PERMISSION|FORBIDDEN/i.test(code)) {
+    return { status: 403, code, body: { error: { message, type: 'permission_error', ...(code ? { code } : {}) } } };
+  }
+
   return { status: mapped.status, code, body: { error: { message, type: mapped.type, ...(code ? { code } : {}) } } };
 }
 
